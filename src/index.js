@@ -11,7 +11,7 @@ const corsBaseHeaders = {
 };
 
 const securityHeaders = {
-  "Referrer-Policy": "no-referrer",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
   "X-Content-Type-Options": "nosniff"
 };
 

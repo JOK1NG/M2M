@@ -914,6 +914,7 @@ export function renderAppHtml() {
     const SEARCH_RETRY_BASE_MS = 1200;
     const SEARCH_RETRY_MAX_MS = 15000;
     const PLAYLIST_NAME_MAX_LENGTH = 100;
+    const APPLE_AUTH_TIMEOUT_MS = 90000;
     const STRONG_MATCH_SCORE = 0.78;
     const FALLBACK_MATCH_SCORE = 0.7;
     const ACCEPT_MATCH_SCORE = 0.55;
@@ -1472,7 +1473,7 @@ export function renderAppHtml() {
         configureMusicKit(state.developerToken);
         addLog(elements.importLog, "打开 Apple Music 授权");
         const music = MusicKit.getInstance();
-        state.musicUserToken = await music.authorize();
+        state.musicUserToken = await authorizeAppleMusic(music);
 
         setImportProgress(8, "Apple Music 已授权");
         addLog(elements.importLog, "授权完成，开始匹配歌曲");
@@ -1505,6 +1506,23 @@ export function renderAppHtml() {
           build: "0.1.0"
         }
       });
+    }
+
+    async function authorizeAppleMusic(music) {
+      let timeoutId = null;
+      const timeout = new Promise((_, reject) => {
+        timeoutId = window.setTimeout(() => {
+          reject(new Error("Apple Music 授权等待超时。请确认已允许弹窗，授权完成后回到此页面；如果仍无反应，请刷新页面后重试。"));
+        }, APPLE_AUTH_TIMEOUT_MS);
+      });
+
+      try {
+        return await Promise.race([music.authorize(), timeout]);
+      } finally {
+        if (timeoutId !== null) {
+          window.clearTimeout(timeoutId);
+        }
+      }
     }
 
     async function refreshHealth() {
