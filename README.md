@@ -7,6 +7,8 @@ M2M is a Cloudflare Workers app for migrating public playlists from Chinese musi
 
 Live demo: https://m2m.xinyu017722.workers.dev/
 
+Changelog: [CHANGELOG.md](CHANGELOG.md)
+
 Languages: [English](#english) | [简体中文](#简体中文)
 
 ## English
