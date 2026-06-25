@@ -918,6 +918,9 @@ export function renderAppHtml() {
     const STRONG_MATCH_SCORE = 0.78;
     const FALLBACK_MATCH_SCORE = 0.7;
     const ACCEPT_MATCH_SCORE = 0.55;
+    const EXPLICIT_VERSION_BONUS = 0.045;
+    const CLEAN_VERSION_PENALTY = 0.07;
+    const EDITED_TITLE_PENALTY = 0.04;
     const QUEUE_POLL_MS = 3000;
     const QUEUE_HEARTBEAT_MS = 12000;
 
@@ -1942,10 +1945,13 @@ export function renderAppHtml() {
       const attributes = candidate.attributes || {};
       const sourceTitle = normalizeText(track.name);
       const candidateTitle = normalizeText(attributes.name);
+      const rawSourceTitle = String(track.name || "");
+      const rawCandidateTitle = String(attributes.name || "");
       const sourceArtists = normalizeText(track.artists.join(" "));
       const candidateArtist = normalizeText(attributes.artistName);
       const sourceAlbum = normalizeText(track.album);
       const candidateAlbum = normalizeText(attributes.albumName);
+      const sourceWantsEditedVersion = hasEditedVersionMarker(rawSourceTitle);
       let score = 0;
 
       if (sourceTitle && candidateTitle === sourceTitle) score += 0.48;
@@ -1966,7 +1972,30 @@ export function renderAppHtml() {
         score += 0.06;
       }
 
+      score += contentRatingScore(attributes.contentRating, sourceWantsEditedVersion);
+      if (!sourceWantsEditedVersion && hasEditedVersionMarker(rawCandidateTitle)) {
+        score -= EDITED_TITLE_PENALTY;
+      }
+
       return score;
+    }
+
+    function contentRatingScore(contentRating, sourceWantsEditedVersion) {
+      const rating = String(contentRating || "").toLowerCase();
+      if (sourceWantsEditedVersion) {
+        return rating === "clean" ? 0.02 : 0;
+      }
+      if (rating === "explicit") {
+        return EXPLICIT_VERSION_BONUS;
+      }
+      if (rating === "clean") {
+        return -CLEAN_VERSION_PENALTY;
+      }
+      return 0;
+    }
+
+    function hasEditedVersionMarker(value) {
+      return /\\b(clean|edited|censored|radio edit|clean version|edited version)\\b|消音|和谐|洁版/i.test(String(value || ""));
     }
 
     function normalizeText(value) {

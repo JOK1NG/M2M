@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## 2026-06-25
+
+### Fixed
+
+- Updated Apple Music match scoring to prefer explicit versions when candidates are otherwise similar, and to penalize clean, censored, edited, or radio-edit results unless the source title explicitly asks for that version.
+
 ## 2026-06-24
 
 ### Fixed
