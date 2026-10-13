@@ -48,7 +48,9 @@ When a source only exposes partial tracks, the API response is marked with `limi
 - Searches the Apple Music catalog by title, artist, and album.
 - Preserves source aliases and normalizes Unicode metadata for multilingual matching.
 - Uses Japanese, Korean, or Russian catalogs to identify translated recordings, then resolves their ISRCs in the subscriber's catalog.
+- Checks mainland China and Japan for ambiguous Han-only titles and uses album and artist aliases as language hints.
 - Coordinates catalog searches globally, shares cached results, and deduplicates concurrent queries.
+- Coalesces queued ISRC lookups within the same region and skips soundtrack descriptions that are not song titles.
 - Imports matched tracks in batches.
 - Shows success count, failure count, total progress, and failed track details.
 - Exports parsed playlist data as JSON.
@@ -298,9 +300,12 @@ Current `wrangler.toml` defaults:
 - `NETEASE_MAX_TRACKS=2000`
 - `NETEASE_BATCH_SIZE=200`
 - `QUEUE_MAX_ACTIVE=2`
-- `APPLE_SEARCH_INTERVAL_MS=250`: minimum time between uncached Apple catalog request starts, shared across users. At most two upstream requests run concurrently.
+- `APPLE_SEARCH_INTERVAL_MS=250`: minimum time between uncached Apple catalog request starts, shared across users. A 429 response increases this interval and pauses new starts for the full `Retry-After` period.
+- `APPLE_SEARCH_CONCURRENCY=4`: maximum upstream requests in flight, bounded to 1–6. Concurrency hides network latency without increasing the configured start rate.
 
 The existing `M2M_QUEUE` Durable Object also coordinates catalog requests; no additional binding or migration is required. Without that binding, local development uses a per-Worker-instance coordinator, which is not a global production rate limit.
+
+The browser matches up to eight tracks concurrently. Queued ISRC lookups can share one upstream request for up to 25 distinct recording codes in the same region; each caller only receives its requested recordings. If a high-confidence recording is identified but no matching ISRC is returned in the account region, bounded alias searches still check for other original releases. If those also fail, the UI reports that separately from an unconfirmed match. This is not proof of a licensing restriction.
 
 Raise these limits only after validating queue behavior, upstream rate limits, and Apple Music import retries.
 
@@ -372,7 +377,9 @@ M2M 是一个部署在 Cloudflare Workers 上的在线歌单迁移工具，用�
 - 按歌名、歌手和专辑在 Apple Music 曲库中搜索匹配。
 - 保留源平台别名，规范化全角、重音和组合字符，改善外文歌曲匹配。
 - 日文、韩文、俄文歌曲可通过原语言地区曲库辅助识别，再以 ISRC 查找用户所在地区的对应录音。
+- 纯汉字歌名可尝试中国区和日区辅助识别，并从专辑及歌手别名中提取语言线索。
 - 全站共享搜索缓存和限流协调，合并正在进行的相同查询。
+- 合并同地区排队中的 ISRC 查询，过滤影视说明等并非歌名的别名。
 - 批量导入匹配成功的歌曲。
 - 实时展示成功数、失败数、总进度和失败详情。
 - 支持导出解析后的 JSON 数据。
@@ -622,9 +629,12 @@ curl https://m2m.xinyu017722.workers.dev/health
 - `NETEASE_MAX_TRACKS=2000`
 - `NETEASE_BATCH_SIZE=200`
 - `QUEUE_MAX_ACTIVE=2`
-- `APPLE_SEARCH_INTERVAL_MS=250`：全站未命中缓存的 Apple 曲库请求最小启动间隔，最多两个上游请求同时进行。
+- `APPLE_SEARCH_INTERVAL_MS=250`：全站未命中缓存的 Apple 曲库请求最小启动间隔。收到 429 后增大间隔，并等待完整的 `Retry-After` 时间。
+- `APPLE_SEARCH_CONCURRENCY=4`：最多同时进行四个上游请求，可配置范围为 1–6。并发用于覆盖网络等待时间，不会提高配置的请求启动频率。
 
 曲库协调复用现有 `M2M_QUEUE` Durable Object，无需新增绑定或迁移。未配置此绑定时，本地开发只使用单个 Worker 实例内的协调器，不能作为生产环境的全站限流方案。
+
+浏览器最多同时匹配八首歌。同地区排队中的 ISRC 查询可合并为一次上游请求，最多包含 25 个不同录音编码，各调用方只接收自己请求的录音。高置信识别出录音、但在账号地区未查到相同 ISRC 时，仍会进行有限的别名搜索，检查其他原版发行；兜底也失败后才显示区别于普通匹配失败的原因，这不等同于已确认版权缺失。
 
 只有在验证队列行为、上游限流和 Apple Music 导入重试后，才建议提高这些限制。
 

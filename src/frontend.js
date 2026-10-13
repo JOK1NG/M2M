@@ -909,9 +909,9 @@ export function renderAppHtml() {
   </div>
 
   <script>
-    const MATCH_CONCURRENCY = 5;
+    const MATCH_CONCURRENCY = 8;
     const SEARCH_RESULT_LIMIT = 25;
-    const SEARCH_REQUEST_INTERVAL_MS = 180;
+    const SEARCH_REQUEST_INTERVAL_MS = 80;
     const SEARCH_MAX_RETRIES = 6;
     const SEARCH_RETRY_BASE_MS = 1200;
     const SEARCH_RETRY_MAX_MS = 15000;
@@ -1701,12 +1701,18 @@ export function renderAppHtml() {
           nextIndex += 1;
           const track = tracks[trackIndex];
           let match = null;
+          let matchNotice = null;
           let failureReason = "Apple Music 未找到匹配";
 
           while (true) {
             try {
-              match = await findAppleSong(music, storefront, track, searchCache, searchLimiter);
+              match = await findAppleSong(music, storefront, track, searchCache, searchLimiter, (notice) => {
+                matchNotice = notice;
+              });
               await waitForImportTurn();
+              if (!match && matchNotice && matchNotice.reason === "recording_unavailable") {
+                failureReason = "目标地区（" + storefront.toUpperCase() + "）未找到同一录音";
+              }
               break;
             } catch (error) {
               if (error && error.name === "ImportCanceledError") throw error;
@@ -1750,9 +1756,10 @@ export function renderAppHtml() {
       return { rows, matched, failed };
     }
 
-    async function findAppleSong(music, storefront, track, searchCache, searchLimiter) {
+    async function findAppleSong(music, storefront, track, searchCache, searchLimiter, onUnmatched) {
       return songMatcher.match(track, {
         storefront,
+        onUnmatched,
         search: (region, query) => searchAppleSongs(music, region, query, searchCache, searchLimiter),
         resolveIsrc: (region, isrcs) => cachedAppleCatalog({ action: "isrc", storefront: region, isrcs }, searchCache, searchLimiter)
       });

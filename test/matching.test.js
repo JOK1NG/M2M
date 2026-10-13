@@ -240,3 +240,155 @@ test("candidate reuse does not bypass a preferred recording that is missing from
   assert.equal(result.id, "target-primary");
   assert.equal(resolutions, 1);
 });
+
+test("uses album and artist aliases to recognize a native catalog", () => {
+  assert.deepEqual(matcher.nativeStorefronts(track("空種", ["南條愛乃"], {
+    album: "穢翼のユースティア"
+  })), ["jp"]);
+  assert.deepEqual(matcher.nativeStorefronts(track("Spring Day", ["BTS"], {
+    artistAliases: ["방탄소년단"]
+  })), ["kr"]);
+});
+
+test("ambiguous Han-only titles try mainland China and Japan without assuming a language", () => {
+  assert.deepEqual(matcher.nativeStorefronts(track("決意", ["V.W.P"])), ["cn", "jp"]);
+  assert.deepEqual(matcher.nativeStorefronts(track("晴天", ["周杰伦"])), ["cn", "jp"]);
+});
+
+test("verifies a Han-only title renamed in the US with just two searches", async () => {
+  const source = track("決意", ["V.W.P"]);
+  const isrc = "JPY392402582";
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us",
+    search: async (region, query) => {
+      calls.push({ region, query });
+      return region === "us" ? [song("us", "Determination", "V.W.P", { isrc })]
+        : [song("native", "決意", "V.W.P", { isrc })];
+    },
+    resolveIsrc: async () => assert.fail("The target search already contains the verified recording")
+  });
+  assert.equal(result.id, "us");
+  assert.equal(result.matchMethod, "isrc");
+  assert.deepEqual(calls.map(call => call.region), ["us", "cn"]);
+});
+
+test("falls back to Japan for an ambiguous title not identifiable in mainland China", async () => {
+  const isrc = "JPY392402582";
+  const calls = [];
+  const result = await matcher.match(track("決意", ["V.W.P"]), {
+    storefront: "us",
+    search: async region => {
+      calls.push(region);
+      return region === "jp" ? [song("jp", "決意", "V.W.P", { isrc })] : [];
+    },
+    resolveIsrc: async region => {
+      assert.equal(region, "us");
+      return [song("us", "Determination", "V.W.P", { isrc })];
+    }
+  });
+  assert.equal(result.id, "us");
+  assert.ok(calls.includes("cn") && calls.includes("jp"));
+});
+
+test("never substitutes a Han-only native song that is unavailable in the subscriber catalog", async () => {
+  const result = await matcher.match(track("決意", ["V.W.P"]), {
+    storefront: "us",
+    search: async region => region === "us" ? [] : [song("native", "決意", "V.W.P", { isrc: "JPY392402582" })],
+    resolveIsrc: async () => []
+  });
+  assert.equal(result, null);
+});
+
+test("filters soundtrack descriptions before applying the alias search budget", () => {
+  const queries = matcher.buildSearchQueries(track("ためすがめ", ["めらみぽっぷ"], {
+    aliases: ["原曲：ニュースハウンド／天狗が見ている", "TV动画《学园孤岛》片头曲", "Tamesugame", "望远镜"]
+  }));
+  assert.ok(queries.some(query => query.includes("Tamesugame")));
+  assert.ok(queries.some(query => query.includes("望远镜")));
+  assert.ok(queries.every(query => !query.includes("原曲：") && !query.includes("TV动画")));
+  assert.ok(matcher.buildSearchQueries(track("Song", ["Artist"], { aliases: ["Theme Song", "电影"] }))
+    .includes("Theme Song"));
+});
+
+test("reports an unavailable recording only after bounded target fallbacks", async () => {
+  const calls = [];
+  const notices = [];
+  const result = await matcher.match(track("歌あ", ["歌手あ"], { aliases: ["Translated title"] }), {
+    storefront: "us",
+    search: async (region, query) => {
+      calls.push({ region, query });
+      return region === "jp" ? [song("jp", "歌あ", "歌手あ", { isrc: "JPWP01671360" })] : [];
+    },
+    resolveIsrc: async () => [],
+    onUnmatched: notice => notices.push(notice)
+  });
+  assert.equal(result, null);
+  assert.equal(calls.length, 5);
+  assert.equal(notices[0].reason, "recording_unavailable");
+});
+
+test("does not lose an available original under a translated alias when another release ISRC is absent", async () => {
+  const result = await matcher.match(track("歌あ", ["歌手あ"], { aliases: ["Translated title"] }), {
+    storefront: "us",
+    search: async (region, query) => region === "jp"
+      ? [song("jp", "歌あ", "歌手あ", { isrc: "JPWP01671360" })]
+      : query.includes("Translated title")
+        ? [song("us-alternative", "Translated title", "歌手あ", { isrc: "JPWP01601512" })] : [],
+    resolveIsrc: async () => [],
+    onUnmatched: () => assert.fail("The alternate original release remains available")
+  });
+  assert.equal(result.id, "us-alternative");
+});
+
+test("does not repeat an unavailable ISRC lookup when two auxiliary catalogs identify the same recording", async () => {
+  let resolutions = 0;
+  const notices = [];
+  const result = await matcher.match(track("決意", ["V.W.P"]), {
+    storefront: "us",
+    search: async region => region === "us" ? [] : [song(region, "決意", "V.W.P", { isrc: "JPY392402582" })],
+    resolveIsrc: async () => { resolutions += 1; return []; },
+    onUnmatched: notice => notices.push(notice)
+  });
+  assert.equal(result, null);
+  assert.equal(resolutions, 1);
+  assert.equal(notices[0].reason, "recording_unavailable");
+});
+
+test("does not claim regional recording unavailability for a weak auxiliary candidate", async () => {
+  let unavailable = false;
+  const result = await matcher.match(track("歌あ", ["歌手あ"], { aliases: ["Translated title"], album: "Different album", durationMs: 204000 }), {
+    storefront: "us",
+    search: async (region, query) => region === "jp"
+      ? [song("jp", "歌あ", "歌手あ", { isrc: "JPWP01671360" })]
+      : query.includes("Translated title") ? [song("us", "Translated title", "歌手あ", { durationInMillis: 204000 })] : [],
+    resolveIsrc: async () => [],
+    onUnmatched: notice => { unavailable = notice.reason === "recording_unavailable"; }
+  });
+  assert.equal(result.id, "us");
+  assert.equal(unavailable, false);
+});
+
+test("preserves a live recording explicitly labeled only in its source album", () => {
+  const source = track("The Legend of Ashitaka", ["Joe Hisaishi"], { album: "WORKS II -Orchestra Nights- (Live)" });
+  const result = matcher.scoreCandidates(source, [
+    song("studio", "The Legend of Ashitaka", "Joe Hisaishi"),
+    song("live", "The Legend of Ashitaka (Symphonic Suite / Live)", "Joe Hisaishi", {
+      albumName: "WORKS II - Orchestra Nights (Live)"
+    })
+  ]);
+  assert.equal(result.id, "live");
+  assert.equal(matcher.scoreCandidates(source, [song("studio", "The Legend of Ashitaka", "Joe Hisaishi")]), null);
+});
+
+test("recognizes live album labels on targets without interpreting Live Forever as a version", () => {
+  assert.equal(matcher.scoreCandidates(track("Song (Live)", ["Artist"]), [
+    song("live", "Song", "Artist", { albumName: "Concert (Live)" })
+  ]).id, "live");
+  assert.equal(matcher.scoreCandidates(track("Song", ["Artist"]), [
+    song("live", "Song", "Artist", { albumName: "Concert (Live)" })
+  ]), null);
+  assert.equal(matcher.scoreCandidates(track("Song", ["Artist"], { album: "Live Forever" }), [
+    song("studio", "Song", "Artist", { albumName: "Live Forever" })
+  ]).id, "studio");
+});

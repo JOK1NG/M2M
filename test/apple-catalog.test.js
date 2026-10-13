@@ -96,6 +96,14 @@ function search(term = "Song", extra = {}) {
   return { action: "search", term, ...extra };
 }
 
+function isrcs(...numbers) {
+  return numbers.map((number) => `USAAA24${String(number).padStart(5, "0")}`);
+}
+
+function isrcSong(isrc, id = isrc) {
+  return { ...song, id, attributes: { ...song.attributes, isrc } };
+}
+
 function appleError(status, code, details) {
   return (error) => {
     assert.ok(error instanceof AppleError);
@@ -210,6 +218,142 @@ test("Apple catalog coordination", async (suite) => {
     assert.deepEqual(await catalogService.request({ action: "isrc", storefront: "us", isrcs: ["USAAA2400002", "USAAA2400001"] }), { data: [song], cacheHit: false });
   });
 
+  await suite.test("batches queued ISRCs and splits sanitized results into independently cached job results", async () => {
+    const time = clock();
+    const calls = [];
+    const firstSong = isrcSong(isrcs(1)[0]);
+    const sharedSong = isrcSong(isrcs(2)[0]);
+    const alternative = isrcSong(isrcs(2)[0], "alternative");
+    const thirdSong = isrcSong(isrcs(3)[0]);
+    const catalogService = service(async (input, options) => {
+      const url = new URL(input);
+      calls.push({ pathname: url.pathname, codes: url.searchParams.get("filter[isrc]"), at: time.now() });
+      assert.equal(options.redirect, "manual");
+      assert.deepEqual(options.headers, { Authorization: "Bearer fake", Accept: "application/json" });
+      if (url.pathname.endsWith("/search")) return response();
+      return response([
+        { ...firstSong, personalToken: "private", attributes: { ...firstSong.attributes, personalNote: "private" } },
+        sharedSong, alternative, thirdSong, isrcSong(isrcs(99)[0]), { id: "no-isrc", type: "songs" }
+      ], 200, {}, "isrc");
+    }, time, { MUSIC_USER_TOKEN: "personal-secret" });
+    await catalogService.request(search("warm"));
+    const payloads = [
+      { action: "isrc", isrcs: isrcs(1, 2), musicUserToken: "personal-secret" },
+      { action: "isrc", isrcs: isrcs(2, 3) },
+      { action: "isrc", isrcs: isrcs(4) }
+    ];
+    const pending = payloads.map((payload) => catalogService.request(payload));
+    const duplicate = catalogService.request({ action: "isrc", isrcs: isrcs(2, 1, 1) });
+    for (let step = 0; step < 4; step += 1) await time.advance(250);
+    const results = await Promise.all(pending);
+    const duplicateResult = await duplicate;
+    assert.deepEqual(calls, [
+      { pathname: "/v1/catalog/cn/search", codes: null, at: 0 },
+      { pathname: "/v1/catalog/cn/songs", codes: isrcs(1, 2, 3, 4).join(","), at: 250 }
+    ]);
+    const expected = [[firstSong, sharedSong, alternative], [sharedSong, alternative, thirdSong], []];
+    assert.deepEqual(results, expected.map((data) => ({ data, cacheHit: false })));
+    assert.deepEqual(duplicateResult, results[0]);
+    results[0].data[1].attributes.name = "Changed";
+    assert.equal(results[1].data[0].attributes.name, "Song");
+    assert.equal(duplicateResult.data[1].attributes.name, "Song");
+    for (let index = 0; index < payloads.length; index += 1) {
+      assert.deepEqual(await catalogService.request(payloads[index]), { data: expected[index], cacheHit: true });
+    }
+    assert.equal(calls.length, 2);
+  });
+
+  await suite.test("batching isolates storefronts and never merges search jobs", async () => {
+    const time = clock();
+    const calls = [];
+    const catalogService = service(async (input) => {
+      const url = new URL(input);
+      calls.push({ pathname: url.pathname, codes: url.searchParams.get("filter[isrc]"), at: time.now() });
+      if (url.pathname.endsWith("/search")) return response();
+      const region = url.pathname.split("/")[3];
+      return response(url.searchParams.get("filter[isrc]").split(",").map((code) => isrcSong(code, `${region}-${code}`)), 200, {}, "isrc");
+    }, time);
+    await catalogService.request(search("warm"));
+    const payloads = [
+      { action: "isrc", storefront: "cn", isrcs: isrcs(1) },
+      search("interleaved", { storefront: "cn" }),
+      { action: "isrc", storefront: "us", isrcs: isrcs(1) },
+      { action: "isrc", storefront: "cn", isrcs: isrcs(2) },
+      { action: "isrc", storefront: "jp", isrcs: isrcs(2) }
+    ];
+    const pending = payloads.map((payload) => catalogService.request(payload));
+    for (let step = 0; step < 5; step += 1) await time.advance(250);
+    const results = await Promise.all(pending);
+    assert.deepEqual(calls.slice(1), [
+      { pathname: "/v1/catalog/cn/songs", codes: isrcs(1, 2).join(","), at: 250 },
+      { pathname: "/v1/catalog/cn/search", codes: null, at: 500 },
+      { pathname: "/v1/catalog/us/songs", codes: isrcs(1).join(","), at: 750 },
+      { pathname: "/v1/catalog/jp/songs", codes: isrcs(2).join(","), at: 1000 }
+    ]);
+    assert.deepEqual(results.map((result) => result.data.map((item) => item.id)), [
+      ["cn-USAAA2400001"], ["123"], ["us-USAAA2400001"], ["cn-USAAA2400002"], ["jp-USAAA2400002"]
+    ]);
+  });
+
+  await suite.test("batch capacity counts distinct ISRCs and leaves overflowing jobs intact", async () => {
+    const time = clock();
+    const batches = [];
+    const catalogService = service(async (input) => {
+      const codes = new URL(input).searchParams.get("filter[isrc]");
+      if (!codes) return response();
+      batches.push(codes.split(","));
+      return response(batches.at(-1).map((code) => isrcSong(code)), 200, {}, "isrc");
+    }, time);
+    await catalogService.request(search("warm"));
+    const firstCodes = isrcs(...Array.from({ length: 25 }, (_, index) => index + 1));
+    const overflowCodes = isrcs(25, 26);
+    const pending = [firstCodes, firstCodes.slice(1), overflowCodes].map((codes) =>
+      catalogService.request({ action: "isrc", isrcs: codes }));
+    for (let step = 0; step < 3; step += 1) await time.advance(250);
+    const results = await Promise.all(pending);
+    assert.deepEqual(batches, [firstCodes, overflowCodes]);
+    assert.deepEqual(results.map((result) => result.data.map((item) => item.attributes.isrc)), [
+      firstCodes, firstCodes.slice(1), overflowCodes
+    ]);
+  });
+
+  await suite.test("40 unique ISRC jobs use two bounded batches while preserving the pending cap and dedupe", async (context) => {
+    const time = clock();
+    const batches = [];
+    const gate = deferred();
+    const catalogService = service(async (input) => {
+      const codes = new URL(input).searchParams.get("filter[isrc]");
+      if (!codes) return response();
+      batches.push(codes.split(","));
+      await gate.promise;
+      return response(codes.split(",").map((code) => isrcSong(code)), 200, {}, "isrc");
+    }, time);
+    await catalogService.request(search("cached"));
+    const payloads = Array.from({ length: 40 }, (_, index) => ({ action: "isrc", isrcs: isrcs(index + 1) }));
+    const pending = payloads.map((payload) => catalogService.request(payload));
+    const duplicate = catalogService.request(payloads[0]);
+    try {
+      await time.advance(250);
+      await assert.rejects(catalogService.request({ action: "isrc", isrcs: isrcs(41) }),
+        appleError(429, "apple_queue_full", { retryAfterMs: 2000 }));
+      assert.equal((await catalogService.request(search("cached"))).cacheHit, true);
+      await time.advance(250);
+    } finally {
+      gate.resolve();
+      for (let step = 0; step < 40; step += 1) await time.advance(250);
+      await Promise.allSettled([...pending, duplicate]);
+    }
+    const results = await Promise.all(pending);
+    assert.deepEqual(batches.map((batch) => batch.length), [25, 15]);
+    assert.deepEqual(batches.flat(), isrcs(...Array.from({ length: 40 }, (_, index) => index + 1)));
+    assert.deepEqual(results.map((result) => result.data[0].attributes.isrc), isrcs(...Array.from({ length: 40 }, (_, index) => index + 1)));
+    assert.deepEqual(await duplicate, results[0]);
+    const next = catalogService.request({ action: "isrc", isrcs: isrcs(41) });
+    await time.advance(250);
+    assert.equal((await next).cacheHit, false);
+    context.diagnostic("ISRC request count: 40 distinct queued jobs -> 2 upstream calls (25 + 15 codes)");
+  });
+
   await suite.test("keeps only public song fields and isolates cached data from mutation", async () => {
     const rawSong = {
       ...song, user: { token: "private" }, relationships: { library: "private" },
@@ -282,7 +426,7 @@ test("Apple catalog coordination", async (suite) => {
     assert.equal(calls, 502);
   });
 
-  await suite.test("spaces all request starts and allows at most two concurrent attempts", async () => {
+  await suite.test("spaces all request starts and honors configured two concurrent attempts", async () => {
     const time = clock();
     const gates = [deferred(), deferred(), deferred()];
     const starts = [];
@@ -296,7 +440,7 @@ test("Apple catalog coordination", async (suite) => {
       await gates[index].promise;
       active -= 1;
       return response([song], 200, {}, new URL(input).pathname.endsWith("/songs") ? "isrc" : "search");
-    }, time);
+    }, time, { APPLE_SEARCH_CONCURRENCY: "2" });
     const requests = [catalogService.request(search("first")),
       catalogService.request({ action: "isrc", storefront: "us", isrcs: ["USAAA2400001"] }),
       catalogService.request(search("third", { storefront: "jp" }))];
@@ -315,6 +459,63 @@ test("Apple catalog coordination", async (suite) => {
     gates[2].resolve();
     await Promise.all(requests);
     assert.equal(maximum, 2);
+  });
+
+  await suite.test("defaults to four concurrent attempts and clamps valid concurrency to one through six", async () => {
+    for (const [configured, maximum] of [
+      [undefined, 4], ["", 4], [" ", 4], ["junk", 4], ["4junk", 4], ["Infinity", 4],
+      [null, 4], [true, 4], ["2.5", 4], ["0", 1], ["-2", 1], ["1", 1], ["2", 2], ["4", 4], [6, 6], ["99", 6]
+    ]) {
+      const time = clock();
+      const gate = deferred();
+      const starts = [];
+      const catalogService = service(async () => {
+        starts.push(time.now());
+        await gate.promise;
+        return response();
+      }, time, configured === undefined ? {} : { APPLE_SEARCH_CONCURRENCY: configured });
+      const pending = Array.from({ length: 7 }, (_, index) => catalogService.request(search(`concurrent ${index}`)));
+      try {
+        await flush();
+        for (let step = 0; step < 6; step += 1) await time.advance(250);
+        assert.deepEqual([...starts], Array.from({ length: maximum }, (_, index) => index * 250), `configuration ${String(configured)}`);
+      } finally {
+        gate.resolve();
+        for (let step = 0; step < 7; step += 1) await time.advance(250);
+        await Promise.allSettled(pending);
+      }
+    }
+  });
+
+  await suite.test("deterministic throughput benchmark preserves 250ms starts with one-second upstream latency", async (context) => {
+    async function benchmark(configured) {
+      const time = clock();
+      const starts = [];
+      let completed = 0;
+      let active = 0;
+      let maximum = 0;
+      const catalogService = service(async () => {
+        starts.push(time.now());
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await time.sleep(1000);
+        active -= 1;
+        completed += 1;
+        return response();
+      }, time, configured === undefined ? {} : { APPLE_SEARCH_CONCURRENCY: configured });
+      const pending = Array.from({ length: 16 }, (_, index) => catalogService.request(search(`benchmark ${index}`)));
+      await flush();
+      for (let step = 0; completed < 16 && step < 80; step += 1) await time.advance(250);
+      await Promise.all(pending);
+      assert.equal(starts.length, 16);
+      assert.ok(starts.slice(1).every((start, index) => start - starts[index] >= 250));
+      return { elapsed: time.now(), maximum };
+    }
+    const previous = await benchmark("2");
+    const optimized = await benchmark();
+    assert.deepEqual(previous, { elapsed: 8250, maximum: 2 });
+    assert.deepEqual(optimized, { elapsed: 4750, maximum: 4 });
+    context.diagnostic(`16 search jobs, 1000ms latency, 250ms interval: concurrency 2 = ${previous.elapsed}ms; default 4 = ${optimized.elapsed}ms`);
   });
 
   await suite.test("uses the default interval and clamps configured intervals", async () => {
@@ -361,6 +562,39 @@ test("Apple catalog coordination", async (suite) => {
     await newcomer;
     assert.equal(starts.length, 3);
     assert.ok(starts[2] >= 30350);
+  });
+
+  await suite.test("a batched 429 rejects every sibling and pauses searches and other storefronts", async () => {
+    const time = clock();
+    const gate = deferred();
+    const starts = [];
+    const catalogService = service(async (input) => {
+      const url = new URL(input);
+      starts.push(time.now());
+      if (url.pathname === "/v1/catalog/cn/songs" && url.searchParams.get("filter[isrc]")?.split(",").includes(isrcs(1)[0])) return gate.promise;
+      return response([], 200, {}, url.pathname.endsWith("/songs") ? "isrc" : "search");
+    }, time);
+    const siblings = [1, 2].map((number) => catalogService.request({ action: "isrc", isrcs: isrcs(number) }));
+    const outcomes = Promise.allSettled(siblings);
+    const queued = catalogService.request(search("queued"));
+    await flush();
+    await time.advance(100);
+    gate.resolve(response([], 429, { "Retry-After": "30" }, "isrc"));
+    await flush();
+    const otherRegion = catalogService.request({ action: "isrc", storefront: "us", isrcs: isrcs(1) });
+    await time.advance(150);
+    assert.deepEqual(starts, [0]);
+    await time.advance(29849);
+    assert.deepEqual(starts, [0]);
+    await time.advance(1);
+    for (let step = 0; step < 3; step += 1) await time.advance(500);
+    const results = await outcomes;
+    await Promise.all([queued, otherRegion]);
+    for (const result of results) {
+      assert.equal(result.status, "rejected");
+      appleError(429, "apple_rate_limited", { retryAfterMs: 30000 })(result.reason);
+    }
+    assert.deepEqual(starts, [0, 30100, 30600]);
   });
 
   await suite.test("honors HTTP-date Retry-After and uses a three-second fallback", async () => {
@@ -515,6 +749,80 @@ test("Apple catalog coordination", async (suite) => {
         return true;
       });
       assert.deepEqual(await catalogService.request(search()), { data: [song], cacheHit: false });
+      assert.equal(calls, 2);
+    }
+  });
+
+  await suite.test("batch failures reject all siblings and duplicates without leaking secrets or caching errors", async () => {
+    for (const [broken, status, code] of [
+      [() => new Response("private upstream Bearer fake", { status: 401 }), 401, "apple_search_failed"],
+      [() => new Response("private upstream Bearer fake", { status: 500 }), 503, "apple_search_unavailable"],
+      [() => { throw new Error("private upstream Bearer fake"); }, 503, "apple_search_unavailable"],
+      [() => new Response("private upstream Bearer fake"), 503, "apple_search_unavailable"],
+      [() => Response.json({ data: "private" }), 503, "apple_search_unavailable"]
+    ]) {
+      let calls = 0;
+      let failing = true;
+      const catalogService = service(async (input) => {
+        calls += 1;
+        if (failing) return broken();
+        const codes = new URL(input).searchParams.get("filter[isrc]").split(",");
+        return response(codes.map((value) => isrcSong(value)), 200, {}, "isrc");
+      });
+      const payloads = [1, 2].map((number) => ({ action: "isrc", isrcs: isrcs(number) }));
+      const failures = [...payloads, payloads[0]].map((payload) => assert.rejects(catalogService.request(payload), (error) => {
+        appleError(status, code)(error);
+        assert.doesNotMatch(`${error.message} ${JSON.stringify(error)}`, /private|Bearer|fake/);
+        assert.equal(error.cause, undefined);
+        return true;
+      }));
+      await Promise.all(failures);
+      const failedCalls = calls;
+      failing = false;
+      const recovered = await Promise.all(payloads.map((payload) => catalogService.request(payload)));
+      assert.deepEqual(recovered, payloads.map((payload) => ({ data: payload.isrcs.map((value) => isrcSong(value)), cacheHit: false })));
+      assert.equal(failedCalls, 1);
+      assert.equal(calls, 2);
+    }
+  });
+
+  await suite.test("the shared 12-second batch deadline covers fetch and body parsing and releases every sibling", async (context) => {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    for (const phase of ["fetch", "body"]) {
+      let calls = 0;
+      let failing = true;
+      let signal;
+      let settled = false;
+      const catalogService = service(async (input, options) => {
+        calls += 1;
+        signal = options.signal;
+        if (failing) {
+          if (phase === "fetch") return new Promise(() => {});
+          return { ok: true, status: 200, json: () => new Promise(() => {}) };
+        }
+        const codes = new URL(input).searchParams.get("filter[isrc]").split(",");
+        return response(codes.map((value) => isrcSong(value)), 200, {}, "isrc");
+      });
+      const payloads = [1, 2].map((number) => ({ action: "isrc", isrcs: isrcs(number) }));
+      const pending = [...payloads, payloads[0]].map((payload) => catalogService.request(payload));
+      const outcomes = Promise.allSettled(pending);
+      outcomes.then(() => { settled = true; });
+      await flush();
+      context.mock.timers.tick(11999);
+      await flush();
+      assert.equal(settled, false);
+      assert.equal(signal.aborted, false);
+      context.mock.timers.tick(1);
+      for (const result of await outcomes) {
+        assert.equal(result.status, "rejected");
+        appleError(503, "apple_search_unavailable")(result.reason);
+      }
+      assert.equal(signal.aborted, true);
+      const failedCalls = calls;
+      failing = false;
+      const recovered = await Promise.all(payloads.map((payload) => catalogService.request(payload)));
+      assert.ok(recovered.every((result) => result.cacheHit === false));
+      assert.equal(failedCalls, 1);
       assert.equal(calls, 2);
     }
   });

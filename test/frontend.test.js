@@ -121,3 +121,32 @@ test("a second import cannot replace a running import's control", async () => {
   vm.runInContext(section, context);
   await context.connectAppleMusic();
 });
+
+test("distinguishes an unavailable recording in the account region from an unconfirmed match", async () => {
+  const { script } = functions();
+  const section = script.slice(script.indexOf("    async function matchAppleSongs("), script.indexOf("    async function findAppleSong("));
+  const context = vm.createContext({ MATCH_CONCURRENCY: 2, SEARCH_REQUEST_INTERVAL_MS: 80, Array, Promise, Map });
+  vm.runInContext(section, context);
+  context.state = { importControl: { running: true }, catalogCache: new Map() };
+  context.createSearchLimiter = () => ({});
+  context.waitForImportTurn = async () => {};
+  context.findAppleSong = async (_music, _region, source, _cache, _limiter, onUnmatched) => {
+    if (onUnmatched) onUnmatched({ reason: source.id === 1 ? "recording_unavailable" : "unconfirmed" });
+    return null;
+  };
+  context.setTrackStatus = () => {};
+  context.recordFailedTrack = () => {};
+  const result = await context.matchAppleSongs(null, "us", [{ id: 1 }, { id: 2 }], () => {});
+  assert.match(result.rows[0].reason, /目标地区.*同一录音/);
+  assert.ok(result.rows[0].reason.includes("US"));
+  assert.ok(!result.rows[0].reason.includes("版权"));
+  assert.notEqual(result.rows[0].reason, result.rows[1].reason);
+});
+
+test("browser workers can keep four upstream requests busy without imposing the upstream throttle on cache hits", () => {
+  const { script } = functions();
+  const concurrency = Number(script.match(/const MATCH_CONCURRENCY = (\d+)/)[1]);
+  const interval = Number(script.match(/const SEARCH_REQUEST_INTERVAL_MS = (\d+)/)[1]);
+  assert.equal(concurrency, 8);
+  assert.ok(interval > 0 && interval <= 100);
+});

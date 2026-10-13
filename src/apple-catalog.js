@@ -53,6 +53,11 @@ export class AppleCatalogService {
     const interval = configuredInterval === undefined || configuredInterval === ""
       ? 250 : Number(configuredInterval);
     this.baseInterval = Number.isFinite(interval) ? Math.max(100, Math.min(5000, Math.floor(interval))) : 250;
+    const configuredConcurrency = env?.APPLE_SEARCH_CONCURRENCY;
+    const concurrency = typeof configuredConcurrency === "number"
+      || (typeof configuredConcurrency === "string" && configuredConcurrency.trim())
+      ? Number(configuredConcurrency) : NaN;
+    this.concurrency = Number.isInteger(concurrency) ? Math.max(1, Math.min(6, concurrency)) : 4;
     this.interval = this.baseInterval;
     this.lastStartedAt = -Infinity;
     this.cooldownUntil = 0;
@@ -107,7 +112,7 @@ export class AppleCatalogService {
     if (this.draining) return;
     this.draining = true;
     try {
-      while (this.queue.length && this.active < 2) {
+      while (this.queue.length && this.active < this.concurrency) {
         const waitMs = Math.max(this.cooldownUntil, this.lastStartedAt + this.interval) - this.now();
         if (waitMs > 0) {
           await this.sleep(waitMs);
@@ -126,8 +131,31 @@ export class AppleCatalogService {
         if (this.now() < Math.max(this.cooldownUntil, this.lastStartedAt + this.interval)) continue;
 
         this.queue.shift();
+        const jobs = [job];
+        let normalized = job.normalized;
+        if (normalized.action === "isrc") {
+          let isrcs = new Set(normalized.isrcs);
+          for (let index = 0; index < this.queue.length; index += 1) {
+            const candidate = this.queue[index];
+            if (candidate.normalized.action !== "isrc" || candidate.normalized.storefront !== normalized.storefront) continue;
+            const combined = new Set([...isrcs, ...candidate.normalized.isrcs]);
+            if (combined.size > 25) continue;
+            isrcs = combined;
+            jobs.push(candidate);
+            this.queue.splice(index, 1);
+            index -= 1;
+          }
+          normalized = { ...normalized, isrcs: [...isrcs].sort() };
+        }
         this.active += 1;
-        this.send(job.normalized, developerToken).then(job.resolve, job.reject).finally(() => {
+        this.send(normalized, developerToken).then((data) => {
+          for (const sibling of jobs) {
+            sibling.resolve(normalized.action === "isrc"
+              ? data.filter((item) => sibling.normalized.isrcs.includes(item.attributes.isrc)) : data);
+          }
+        }, (error) => {
+          for (const sibling of jobs) sibling.reject(error);
+        }).finally(() => {
           this.active -= 1;
           this.drain();
         });

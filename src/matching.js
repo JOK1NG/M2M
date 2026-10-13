@@ -62,12 +62,20 @@ export function createSongMatcher() {
   }
 
   function compatibleVersion(track, candidate) {
-    const source = versions(track.name);
-    const target = versions(candidate.attributes?.name);
+    const source = recordingVersions(track.name, track.album);
+    const target = recordingVersions(candidate.attributes?.name, candidate.attributes?.albumName);
     const sourceLabels = namedVersions(track.name);
     const targetLabels = namedVersions(candidate.attributes?.name);
     return source.length === target.length && source.every(version => target.includes(version)) &&
       sourceLabels.length === targetLabels.length && sourceLabels.every(label => targetLabels.includes(label));
+  }
+
+  function recordingVersions(name, album) {
+    const markers = versions(name);
+    const albumText = String(album || "").normalize("NFKC");
+    const liveAlbum = /[([][^)\]]*\blive\b[^)\]]*[)\]]|\blive (?:at|in|from)\b|ライブ盤|现场专辑|現場專輯/iu.test(albumText);
+    if (liveAlbum && !markers.includes("live")) markers.push("live");
+    return markers;
   }
 
   function namedVersions(value) {
@@ -93,7 +101,7 @@ export function createSongMatcher() {
   function scoreCandidate(track, candidate) {
     const attributes = candidate?.attributes || {};
     if (!compatibleVersion(track, candidate)) return 0;
-    const sourceTitles = strings([track.name, track.aliases || []]).flatMap(titleForms);
+    const sourceTitles = searchTitles(track).flatMap(titleForms);
     const title = bestSimilarity(sourceTitles, titleForms(attributes.name));
     const sourceArtists = strings([track.artists || [], track.artistAliases || []]).map(normalizeText);
     const artist = bestSimilarity(sourceArtists, [normalizeText(attributes.artistName)]);
@@ -117,18 +125,32 @@ export function createSongMatcher() {
     return rankedCandidates(track, candidates)[0] || null;
   }
 
+  function searchTitles(track) {
+    const aliases = strings(track.aliases || []).filter(alias =>
+      !/^原曲\s*[:：]|《[^》]+》.*(?:片头|片尾|主题|插曲|OP|ED)|^(?:TV|テレビ|映画|ドラマ).*?(?:主題歌|挿入歌|オープニング|エンディング)/iu.test(alias));
+    const seen = new Set();
+    return strings([track.name, aliases]).filter(name => {
+      const key = normalizeText(name);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
   function buildSearchQueries(track) {
-    const names = strings([track.name, track.aliases || []]).slice(0, 3);
+    const names = searchTitles(track).slice(0, 3);
     const artist = (track.artists || [])[0] || "";
     return strings(names.flatMap(name => [name + " " + artist, name])).slice(0, 6);
   }
 
   function nativeStorefronts(track) {
-    const text = strings([track.name, track.artists || [], track.aliases || []]).join(" ");
+    const core = strings([track.name, track.artists || [], track.artistAliases || []]).join(" ");
+    const text = strings([core, searchTitles(track), track.album, track.albumAliases || []]).join(" ");
     const regions = [];
     if (/\p{Script=Hiragana}|\p{Script=Katakana}/u.test(text)) regions.push("jp");
     if (/\p{Script=Hangul}/u.test(text)) regions.push("kr");
     if (/\p{Script=Cyrillic}/u.test(text)) regions.push("ru");
+    if (!regions.length && /\p{Script=Han}/u.test(core)) regions.push("cn", "jp");
     return regions.slice(0, 2);
   }
 
@@ -142,10 +164,13 @@ export function createSongMatcher() {
   async function match(track, options) {
     const storefront = options.storefront || "cn";
     const queries = buildSearchQueries(track);
+    const resolvedIsrcs = new Set();
+    let identifiedUnavailable = false;
     if (!track.name || !queries.length) return null;
     if (track.isrc && options.resolveIsrc) {
       const direct = verifiedMatch(track, await options.resolveIsrc(storefront, [track.isrc]), [track.isrc]);
       if (direct) return direct;
+      resolvedIsrcs.add(track.isrc);
     }
     let best = null;
     const targetCandidates = await options.search(storefront, queries[0]);
@@ -167,9 +192,15 @@ export function createSongMatcher() {
           if (!isrcs.length) continue;
           const known = verifiedMatch(track, targetCandidates, isrcs);
           if (known && known.attributes.isrc === isrcs[0]) return known;
-          const resolved = verifiedMatch(track, await options.resolveIsrc(storefront, isrcs), isrcs);
+          const remainingIsrcs = isrcs.filter(isrc => !resolvedIsrcs.has(isrc));
+          const recordings = remainingIsrcs.length ? await options.resolveIsrc(storefront, remainingIsrcs) : [];
+          remainingIsrcs.forEach(isrc => resolvedIsrcs.add(isrc));
+          const resolved = verifiedMatch(track, recordings, isrcs);
           if (resolved) return resolved;
           if (known) return known;
+          if (!best && originals.find(candidate => candidate.attributes.isrc === isrcs[0]).score >= strongScore) {
+            identifiedUnavailable = true;
+          }
           break;
         }
       }
@@ -178,6 +209,9 @@ export function createSongMatcher() {
       const result = scoreCandidates(track, await options.search(storefront, query));
       if (result && (!best || result.score > best.score)) best = result;
       if (best && best.score >= strongScore) return best;
+    }
+    if (!best && options.onUnmatched) {
+      options.onUnmatched({ reason: identifiedUnavailable ? "recording_unavailable" : "unconfirmed", storefront });
     }
     return best;
   }
