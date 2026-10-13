@@ -3,6 +3,34 @@ import test from "node:test";
 
 import { AppleError } from "../src/apple.js";
 
+test("preserves the native global fetch receiver required by Workers", async (context) => {
+  const { AppleCatalogService } = await import("../src/apple-catalog.js");
+  context.mock.method(globalThis, "fetch", function () {
+    assert.equal(this, globalThis);
+    return Promise.resolve(Response.json({ results: { songs: { data: [] } } }));
+  });
+  const service = new AppleCatalogService({ APPLE_DEVELOPER_TOKEN: "fake-test-token" });
+  const result = await service.request({ action: "search", storefront: "cn", term: "Song" });
+  assert.deepEqual(result.data, []);
+});
+
+test("uses manual redirects supported by Workers and never forwards authorization to a redirect target", async () => {
+  const { AppleCatalogService } = await import("../src/apple-catalog.js");
+  let attempts = 0;
+  let redirect;
+  const service = new AppleCatalogService({ APPLE_DEVELOPER_TOKEN: "fake-test-token" }, {
+    fetcher: async (_url, options) => {
+      attempts += 1;
+      redirect = options.redirect;
+      return new Response(null, { status: 302, headers: { Location: "https://untrusted.example/" } });
+    }
+  });
+  await assert.rejects(service.request({ action: "search", storefront: "cn", term: "Song" }),
+    error => error.code === "apple_search_unavailable");
+  assert.equal(attempts, 1);
+  assert.equal(redirect, "manual");
+});
+
 const song = {
   id: "123",
   type: "songs",
@@ -162,7 +190,7 @@ test("Apple catalog coordination", async (suite) => {
       assert.equal(headers.get("Authorization"), "Bearer fake");
       assert.equal(headers.has("Music-User-Token"), false);
       assert.equal(options.method, "GET");
-      assert.equal(options.redirect, "error");
+      assert.equal(options.redirect, "manual");
       assert.ok(options.signal instanceof AbortSignal);
       return response();
     }, clock(0, true), { MUSIC_USER_TOKEN: "personal-secret" });

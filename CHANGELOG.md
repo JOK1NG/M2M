@@ -11,10 +11,11 @@ All notable changes to this project are recorded here.
 - 完整遵守 Apple 的 `Retry-After`，持续搜索故障会暂停导入并保留进度，避免把临时故障计为歌曲不存在。
 - 加强原版、伴奏、翻唱、现场和重新录制版本检查，保留可信匹配中的 Explicit / E 版本优先策略。
 - 减少大歌单页面重复重绘，修复取消任务后旧搜索继续运行的问题，并限制队列代理路径以避免绕过曲库接口校验。
+- 修复 Cloudflare Workers 原生 `fetch` 调用上下文及不支持的重定向模式造成的曲库搜索 `503`，补充运行时回归验证；不会向重定向目标转发授权头。
 
 ### Validation
 
-- 79 automated tests, including multilingual matching, shared request scheduling, rate-limit recovery, cancellation, request validation, and browser matcher execution after Workers bundling.
+- 81 automated tests, including multilingual matching, shared request scheduling, rate-limit recovery, cancellation, request validation, native fetch receiver binding, safe manual redirects, and browser matcher execution after Workers bundling.
 - Read-only live catalog checks verified Japanese-to-mainland-China recording identification and corrected vocal/original-version selection. These checks do not imply a guaranteed match rate or fixed throughput.
 
 ### Added
@@ -29,6 +30,8 @@ All notable changes to this project are recorded here.
 - Reduced large-playlist DOM updates by indexing track badges and updating failed rows individually.
 - Waited for canceled search workers to finish before allowing another import, and rejected arbitrary paths through the queue proxy.
 - Kept the browser matcher self-contained after Wrangler bundling and added a deployment-configuration regression test.
+- Bound the native global fetch function to its Workers receiver to prevent catalog searches from failing before reaching Apple.
+- Used Workers-supported manual redirects and rejected redirect responses without forwarding developer authorization.
 
 ## 2026-06-25
 

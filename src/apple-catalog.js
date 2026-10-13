@@ -44,7 +44,7 @@ export function normalizeCatalogRequest(payload) {
 export class AppleCatalogService {
   constructor(env = {}, options = {}) {
     this.env = env;
-    this.fetcher = options.fetcher || fetch;
+    this.fetcher = options.fetcher || fetch.bind(globalThis);
     this.now = options.now || Date.now;
     this.sleep = options.sleep || ((milliseconds) => new Promise((resolve) => {
       setTimeout(resolve, Math.min(milliseconds, 2147483647));
@@ -191,7 +191,7 @@ export class AppleCatalogService {
       this.lastStartedAt = this.now();
       response = await this.fetcher(url, {
         method: "GET",
-        redirect: "error",
+        redirect: "manual",
         headers: { Authorization: `Bearer ${developerToken}`, Accept: "application/json" },
         signal
       });
