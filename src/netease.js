@@ -134,16 +134,29 @@ export function buildTracks(trackIds, songsById) {
       };
     }
 
+    const artists = song.artists || song.ar || [];
+    const album = song.album || song.al || {};
+    const aliases = metadataAliases(song);
+    const artistAliases = artists.flatMap(metadataAliases);
+    const albumAliases = metadataAliases(album);
     return {
       index: index + 1,
       id: trackId,
       name: song.name || null,
-      artists: (song.artists || song.ar || []).map((artist) => artist.name).filter(Boolean),
-      album: (song.album && song.album.name) || (song.al && song.al.name) || null,
+      artists: artists.map((artist) => artist.name).filter(Boolean),
+      album: album.name || null,
       durationMs: song.duration || song.dt || null,
+      ...(aliases.length ? { aliases } : {}),
+      ...(artistAliases.length ? { artistAliases: Array.from(new Set(artistAliases)) } : {}),
+      ...(albumAliases.length ? { albumAliases } : {}),
       missing: false
     };
   });
+}
+
+function metadataAliases(metadata) {
+  return Array.from(new Set([metadata.alias, metadata.alia, metadata.transNames, metadata.tns, metadata.trans]
+    .flat().filter(value => typeof value === "string" && value.trim()).map(value => value.trim())));
 }
 
 async function resolvePlaylistId(input, fetcher) {

@@ -46,6 +46,9 @@ When a source only exposes partial tracks, the API response is marked with `limi
 - Authorizes Apple Music with MusicKit JS in the browser.
 - Creates a new Apple Music playlist with a user-provided name.
 - Searches the Apple Music catalog by title, artist, and album.
+- Preserves source aliases and normalizes Unicode metadata for multilingual matching.
+- Uses Japanese, Korean, or Russian catalogs to identify translated recordings, then resolves their ISRCs in the subscriber's catalog.
+- Coordinates catalog searches globally, shares cached results, and deduplicates concurrent queries.
 - Imports matched tracks in batches.
 - Shows success count, failure count, total progress, and failed track details.
 - Exports parsed playlist data as JSON.
@@ -70,6 +73,8 @@ When a source only exposes partial tracks, the API response is marked with `limi
 - `src/playlist.js`: Multi-platform playlist source detection and parsing.
 - `src/netease.js`: NetEase playlist parser.
 - `src/apple.js`: Apple Music Developer Token generation.
+- `src/matching.js`: Shared multilingual matching and recording/version checks.
+- `src/apple-catalog.js`: Public catalog cache, global request scheduling, and Apple rate-limit handling.
 - `src/queue.js`: Durable Object queue coordinator.
 - `test/*.test.js`: Node.js test suites.
 
@@ -82,8 +87,11 @@ The backend only handles:
 - Public playlist parsing.
 - Temporary queue state.
 - Site-level Apple Music Developer Token generation.
+- Public Apple Music catalog searches and temporary in-memory caching of catalog results.
 
 Apple Music user authorization is handled by MusicKit JS in the browser. Requests that modify the user's Apple Music library use the browser-side Music User Token.
+
+Catalog requests contain a region and public track metadata, never a Music User Token. The shared cache holds up to 500 queries, with a six-hour TTL for results and five minutes for empty results. It is not persisted to Durable Object storage and can be cleared when the instance restarts. Playlist creation and library writes remain browser-to-Apple requests.
 
 ### Apple Music Authentication
 
@@ -184,6 +192,12 @@ Legacy aliases are still available:
 
 Returns an Apple Music Developer Token for MusicKit JS.
 
+#### `POST /apple/catalog`
+
+Searches public catalog songs or resolves recordings by ISRC through the shared coordinator. Requests accept either `{ "action": "search", "storefront": "cn", "term": "song artist", "limit": 25 }` or `{ "action": "isrc", "storefront": "cn", "isrcs": ["JPWP01671360"] }`. The response contains `data` and `cacheHit`. No subscriber credentials are required or forwarded.
+
+Invalid requests are rejected. Temporary errors include `error.details.retryAfterMs`, and the frontend respects the full delay. After repeated temporary failures, the import pauses without counting the current track as missing.
+
 ### Local Development
 
 ```sh
@@ -191,6 +205,8 @@ npm install
 npm test
 npm run dev
 ```
+
+The Wrangler configuration sets `keep_names = false` so the shared matcher embedded in the browser remains self-contained after bundling. The bundle regression test checks this using the deployment configuration.
 
 Test the parser locally:
 
@@ -282,6 +298,9 @@ Current `wrangler.toml` defaults:
 - `NETEASE_MAX_TRACKS=2000`
 - `NETEASE_BATCH_SIZE=200`
 - `QUEUE_MAX_ACTIVE=2`
+- `APPLE_SEARCH_INTERVAL_MS=250`: minimum time between uncached Apple catalog request starts, shared across users. At most two upstream requests run concurrently.
+
+The existing `M2M_QUEUE` Durable Object also coordinates catalog requests; no additional binding or migration is required. Without that binding, local development uses a per-Worker-instance coordinator, which is not a global production rate limit.
 
 Raise these limits only after validating queue behavior, upstream rate limits, and Apple Music import retries.
 
@@ -289,6 +308,8 @@ Raise these limits only after validating queue behavior, upstream rate limits, a
 
 - Apple Music search may return wrong versions for covers, remixes, same-name tracks, or region-limited songs.
 - Apple Music API rate limits can affect large imports.
+- Requests cannot bypass Apple's developer-token quota. Cold searches and cross-language fallbacks take longer than cache hits; throughput is not guaranteed.
+- Native-language catalog lookups never authorize importing songs unavailable in the subscriber's region. ISRC availability and source metadata quality still limit matches.
 - Upstream music platform page structures may change.
 - Some Kugou share pages expose preview tracks only.
 
@@ -349,6 +370,9 @@ M2M 是一个部署在 Cloudflare Workers 上的在线歌单迁移工具，用�
 - 通过 MusicKit JS 在浏览器中完成 Apple Music 授权。
 - 使用用户输入的名称创建 Apple Music 歌单。
 - 按歌名、歌手和专辑在 Apple Music 曲库中搜索匹配。
+- 保留源平台别名，规范化全角、重音和组合字符，改善外文歌曲匹配。
+- 日文、韩文、俄文歌曲可通过原语言地区曲库辅助识别，再以 ISRC 查找用户所在地区的对应录音。
+- 全站共享搜索缓存和限流协调，合并正在进行的相同查询。
 - 批量导入匹配成功的歌曲。
 - 实时展示成功数、失败数、总进度和失败详情。
 - 支持导出解析后的 JSON 数据。
@@ -373,6 +397,8 @@ M2M 是一个部署在 Cloudflare Workers 上的在线歌单迁移工具，用�
 - `src/playlist.js`：多平台歌单来源识别和解析。
 - `src/netease.js`：网易云歌单解析器。
 - `src/apple.js`：Apple Music Developer Token 生成。
+- `src/matching.js`：多语言匹配、录音识别与版本检查。
+- `src/apple-catalog.js`：公开曲库缓存、共享请求调度与 Apple 限流处理。
 - `src/queue.js`：Durable Object 队列协调器。
 - `test/*.test.js`：Node.js 测试。
 
@@ -385,8 +411,11 @@ M2M 不会在服务端保存用户账号、Apple ID、Apple Music User Token 或
 - 解析公开歌单链接。
 - 维护临时排队状态。
 - 生成站点级 Apple Music Developer Token。
+- 搜索 Apple Music 公开曲库，临时缓存曲库搜索结果。
 
 用户级 Apple Music 授权由 MusicKit JS 在浏览器内完成。修改用户 Apple Music 资料库的请求使用浏览器中的 Music User Token。
+
+曲库请求仅携带地区和公开歌曲信息，不携带 Music User Token。共享内存缓存最多保留 500 个查询，有结果缓存 6 小时，空结果缓存 5 分钟；不会写入 Durable Object 持久存储，实例重启后可能清空。创建歌单和写入资料库仍由浏览器直接请求 Apple。
 
 ### Apple Music 授权
 
@@ -487,6 +516,12 @@ curl "https://m2m.xinyu017722.workers.dev/playlist?url=https%3A%2F%2F163cn.tv%2F
 
 返回 MusicKit JS 使用的 Apple Music Developer Token。
 
+#### `POST /apple/catalog`
+
+通过共享协调器搜索公开歌曲，或按 ISRC 查找对应录音。请求体为 `{ "action": "search", "storefront": "cn", "term": "歌名 歌手", "limit": 25 }` 或 `{ "action": "isrc", "storefront": "cn", "isrcs": ["JPWP01671360"] }`，返回 `data` 与 `cacheHit`。无需提供用户授权凭据，也不会向 Apple 转发用户 token。
+
+临时错误会包含 `error.details.retryAfterMs`，前端按完整等待时间重试。多次临时失败后暂停导入，当前曲目不会被计为未找到。
+
 ### 本地开发
 
 ```sh
@@ -494,6 +529,8 @@ npm install
 npm test
 npm run dev
 ```
+
+Wrangler 配置使用 `keep_names = false`，保证嵌入浏览器的共享匹配器在打包后仍可独立运行；构建回归测试会使用部署配置验证这一点。
 
 本地测试解析接口：
 
@@ -585,6 +622,9 @@ curl https://m2m.xinyu017722.workers.dev/health
 - `NETEASE_MAX_TRACKS=2000`
 - `NETEASE_BATCH_SIZE=200`
 - `QUEUE_MAX_ACTIVE=2`
+- `APPLE_SEARCH_INTERVAL_MS=250`：全站未命中缓存的 Apple 曲库请求最小启动间隔，最多两个上游请求同时进行。
+
+曲库协调复用现有 `M2M_QUEUE` Durable Object，无需新增绑定或迁移。未配置此绑定时，本地开发只使用单个 Worker 实例内的协调器，不能作为生产环境的全站限流方案。
 
 只有在验证队列行为、上游限流和 Apple Music 导入重试后，才建议提高这些限制。
 
@@ -592,6 +632,8 @@ curl https://m2m.xinyu017722.workers.dev/health
 
 - Apple Music 搜索可能因为翻唱、混音、同名曲目或地区版权返回错误版本。
 - Apple Music API 限流会影响大歌单导入。
+- 无法绕过 Apple 按开发者令牌计算的额度；首次搜索及外文兜底比缓存命中慢，不保证固定每秒匹配数量。
+- 原语言地区只辅助识别，最终仍需确认录音在用户地区可用；ISRC 覆盖和源歌曲元数据质量仍会限制匹配效果。
 - 上游音乐平台页面结构可能变化。
 - 部分酷狗分享页只暴露预览曲目。
 

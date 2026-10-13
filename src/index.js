@@ -1,4 +1,5 @@
 import { AppleError, createAppleDeveloperToken, hasAppleCredentials } from "./apple.js";
+import { AppleCatalogService, normalizeCatalogRequest } from "./apple-catalog.js";
 import { renderAppHtml } from "./frontend.js";
 import { PlaylistError, SUPPORTED_SOURCES, extractPlaylist, isPlaylistError } from "./playlist.js";
 export { QueueCoordinator } from "./queue.js";
@@ -14,6 +15,8 @@ const securityHeaders = {
   "Referrer-Policy": "strict-origin-when-cross-origin",
   "X-Content-Type-Options": "nosniff"
 };
+
+let localCatalogService;
 
 export default {
   async fetch(request, env) {
@@ -44,7 +47,8 @@ export default {
             "/playlist/stream",
             "/netease/playlist",
             "/netease/playlist/stream",
-            "/apple/developer-token"
+            "/apple/developer-token",
+            "/apple/catalog"
           ],
           supportedSources: SUPPORTED_SOURCES,
           appleConfigured: hasAppleCredentials(env),
@@ -69,6 +73,10 @@ export default {
 
       if (requestUrl.pathname === "/apple/developer-token") {
         return await handleAppleDeveloperToken(request, env);
+      }
+
+      if (requestUrl.pathname === "/apple/catalog") {
+        return await handleAppleCatalog(request, env);
       }
 
       return jsonResponse(
@@ -187,6 +195,9 @@ async function handlePlaylistStream(request, env, requestUrl) {
 }
 
 async function handleQueue(request, env, requestUrl) {
+  if (!["/queue/join", "/queue/status", "/queue/heartbeat", "/queue/leave"].includes(requestUrl.pathname)) {
+    throw new PlaylistError(404, "not_found", "Queue route not found.");
+  }
   if (!hasQueueBinding(env)) {
     return jsonResponse({
       status: "active",
@@ -269,6 +280,56 @@ async function handleAppleDeveloperToken(request, env) {
 
   const token = await createAppleDeveloperToken(env);
   return jsonResponse(token, 200, request, env);
+}
+
+async function handleAppleCatalog(request, env) {
+  if (request.method !== "POST") {
+    throw new AppleError(405, "method_not_allowed", "Use POST.");
+  }
+  if (!request.headers.get("Content-Type")?.includes("application/json")) {
+    throw new AppleError(415, "invalid_content_type", "Use application/json.");
+  }
+  const body = await readCatalogBody(request);
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    throw new AppleError(400, "invalid_json", "Request body must be valid JSON.");
+  }
+  const normalized = normalizeCatalogRequest(payload);
+  if (hasQueueBinding(env)) {
+    const response = await queueObject(env).fetch(new Request("https://m2m-queue.local/apple/catalog", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(normalized)
+    }));
+    const result = withResponseHeaders(response, request, env);
+    result.headers.set("Cache-Control", "no-store");
+    return result;
+  }
+  if (!localCatalogService) localCatalogService = new AppleCatalogService(env);
+  return jsonResponse(await localCatalogService.request(normalized), 200, request, env);
+}
+
+async function readCatalogBody(request) {
+  const reader = request.body?.getReader();
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let total = 0;
+  let body = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > 8192) {
+        await reader.cancel();
+        throw new AppleError(413, "body_too_large", "Catalog request is too large.");
+      }
+      body += decoder.decode(value, { stream: true });
+    }
+    return body + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function readJsonBody(request) {

@@ -49,6 +49,17 @@ test("builds normalized tracks in playlist order", () => {
   ]);
 });
 
+test("retains translated titles and artist aliases for cross-language matching", () => {
+  const tracks = buildTracks([1], new Map([[1, {
+    id: 1, name: "生きていたんだよな", alias: ["Ikiteitandayona"], transNames: ["曾经活着啊"],
+    artists: [{ name: "あいみょん", alias: ["Aimyon"], trans: "爱缪" }],
+    album: { name: "生きていたんだよな", alias: ["Ikiteitandayona"] }, duration: 194120
+  }]]));
+  assert.deepEqual(tracks[0].aliases, ["Ikiteitandayona", "曾经活着啊"]);
+  assert.deepEqual(tracks[0].artistAliases, ["Aimyon", "爱缪"]);
+  assert.deepEqual(tracks[0].albumAliases, ["Ikiteitandayona"]);
+});
+
 test("extracts a playlist with a fake fetcher", async () => {
   const fakeFetch = async (url) => {
     if (url.includes("/api/v6/playlist/detail")) {

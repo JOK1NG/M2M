@@ -1,3 +1,5 @@
+import { createSongMatcher } from "./matching.js";
+
 export function renderAppHtml() {
   return `<!doctype html>
 <html lang="zh-CN">
@@ -890,7 +892,7 @@ export function renderAppHtml() {
 
         <div class="side-section">
           <p class="side-title">隐私边界</p>
-          <p class="side-copy">后端负责解析公开歌单和提供站点级 Apple Developer Token；你的 Apple ID 授权留在浏览器。</p>
+          <p class="side-copy">后端处理公开歌单和曲库查询；Apple ID 授权与资料库写入在浏览器中完成。</p>
         </div>
       </aside>
     </div>
@@ -908,19 +910,14 @@ export function renderAppHtml() {
 
   <script>
     const MATCH_CONCURRENCY = 5;
-    const SEARCH_RESULT_LIMIT = 5;
+    const SEARCH_RESULT_LIMIT = 25;
     const SEARCH_REQUEST_INTERVAL_MS = 180;
     const SEARCH_MAX_RETRIES = 6;
     const SEARCH_RETRY_BASE_MS = 1200;
     const SEARCH_RETRY_MAX_MS = 15000;
     const PLAYLIST_NAME_MAX_LENGTH = 100;
     const APPLE_AUTH_TIMEOUT_MS = 90000;
-    const STRONG_MATCH_SCORE = 0.78;
-    const FALLBACK_MATCH_SCORE = 0.7;
-    const ACCEPT_MATCH_SCORE = 0.55;
-    const EXPLICIT_VERSION_BONUS = 0.045;
-    const CLEAN_VERSION_PENALTY = 0.07;
-    const EDITED_TITLE_PENALTY = 0.04;
+    const songMatcher = (${createSongMatcher.toString()})();
     const QUEUE_POLL_MS = 3000;
     const QUEUE_HEARTBEAT_MS = 12000;
 
@@ -930,6 +927,9 @@ export function renderAppHtml() {
       developerToken: null,
       musicUserToken: null,
       importRows: [],
+      catalogCache: new Map(),
+      trackBadges: new Map(),
+      failedTrackRows: new Map(),
       importControl: null,
       failedTracks: new Map(),
       rateLimitNoticeAt: 0,
@@ -1053,6 +1053,7 @@ export function renderAppHtml() {
     }
 
     function resetToInput() {
+      if (state.importControl && state.importControl.running) cancelImport();
       releaseQueue("reset");
       state.parsed = null;
       state.parseProgress = 0;
@@ -1436,10 +1437,13 @@ export function renderAppHtml() {
           "<td><span class=\\"badge\\" data-import-status=\\"" + track.id + "\\">未开始</span></td>" +
         "</tr>";
       }).join("");
+      state.trackBadges = new Map(Array.from(elements.trackTable.querySelectorAll("[data-import-status]"))
+        .map((badge) => [badge.dataset.importStatus, badge]));
     }
 
     async function connectAppleMusic() {
       if (!state.parsed) return;
+      if (state.importControl && state.importControl.running) return;
       const playlistNameResult = validatePlaylistNameInput(true);
       if (!playlistNameResult.ok) {
         return;
@@ -1606,7 +1610,7 @@ export function renderAppHtml() {
 
     async function importToAppleMusic(music, parsed, playlistName) {
       const tracks = parsed.tracks.filter((track) => !track.missing);
-      const storefront = music.storefrontId || "us";
+      const storefront = music.storefrontId || "cn";
 
       elements.importTotal.textContent = String(tracks.length);
       state.rateLimitNoticeAt = 0;
@@ -1676,7 +1680,7 @@ export function renderAppHtml() {
 
     async function matchAppleSongs(music, storefront, tracks, onProgress) {
       const rows = new Array(tracks.length);
-      const searchCache = new Map();
+      const searchCache = state.catalogCache;
       const searchLimiter = createSearchLimiter(SEARCH_REQUEST_INTERVAL_MS);
       let nextIndex = 0;
       let completed = 0;
@@ -1699,11 +1703,25 @@ export function renderAppHtml() {
           let match = null;
           let failureReason = "Apple Music 未找到匹配";
 
-          try {
-            match = await findAppleSong(music, storefront, track, searchCache, searchLimiter);
-          } catch (error) {
-            failureReason = "搜索失败：" + readableError(error);
-            console.warn("Apple Music search failed", error);
+          while (true) {
+            try {
+              match = await findAppleSong(music, storefront, track, searchCache, searchLimiter);
+              await waitForImportTurn();
+              break;
+            } catch (error) {
+              if (error && error.name === "ImportCanceledError") throw error;
+              if (shouldRetryAppleSearch(error) && error.code !== "apple_credentials_missing") {
+                pauseForAppleSearch();
+                await waitForImportTurn();
+                continue;
+              }
+              if (getErrorStatus(error) === 401 || getErrorStatus(error) === 403 || error.code === "apple_credentials_missing") {
+                if (state.importControl) state.importControl.canceled = true;
+                throw error;
+              }
+              failureReason = "搜索失败：" + readableError(error);
+              break;
+            }
           }
 
           if (match) {
@@ -1723,7 +1741,9 @@ export function renderAppHtml() {
       }
 
       const workerCount = Math.min(MATCH_CONCURRENCY, tracks.length);
-      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+      const outcomes = await Promise.allSettled(Array.from({ length: workerCount }, () => runWorker()));
+      const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+      if (rejected) throw rejected.reason;
       if (state.importControl && state.importControl.canceled) {
         throw createImportCanceledError();
       }
@@ -1731,44 +1751,22 @@ export function renderAppHtml() {
     }
 
     async function findAppleSong(music, storefront, track, searchCache, searchLimiter) {
-      const queries = buildSearchQueries(track);
-      let best = null;
-
-      if (!queries.length) {
-        return null;
-      }
-
-      best = scoreCandidates(track, await searchAppleSongs(music, storefront, queries[0], searchCache, searchLimiter));
-      if (best && best.score >= FALLBACK_MATCH_SCORE) {
-        return best.score >= ACCEPT_MATCH_SCORE ? best : null;
-      }
-
-      const fallbackQueries = queries.slice(1);
-      if (fallbackQueries.length) {
-        for (const query of fallbackQueries) {
-          const candidates = await searchAppleSongs(music, storefront, query, searchCache, searchLimiter);
-          const candidateBest = scoreCandidates(track, candidates);
-          if (candidateBest && (!best || candidateBest.score > best.score)) {
-            best = candidateBest;
-          }
-          if (best && best.score >= STRONG_MATCH_SCORE) {
-            break;
-          }
-        }
-      }
-
-      return best && best.score >= ACCEPT_MATCH_SCORE ? best : null;
+      return songMatcher.match(track, {
+        storefront,
+        search: (region, query) => searchAppleSongs(music, region, query, searchCache, searchLimiter),
+        resolveIsrc: (region, isrcs) => cachedAppleCatalog({ action: "isrc", storefront: region, isrcs }, searchCache, searchLimiter)
+      });
     }
 
     async function searchAppleSongs(music, storefront, query, searchCache, searchLimiter) {
-      const cacheKey = storefront + ":" + normalizeText(query);
+      return cachedAppleCatalog({ action: "search", storefront, term: query, limit: SEARCH_RESULT_LIMIT }, searchCache, searchLimiter);
+    }
+
+    async function cachedAppleCatalog(payload, searchCache, searchLimiter) {
+      const cacheKey = JSON.stringify(payload);
       if (!searchCache.has(cacheKey)) {
-        const searchPromise = searchAppleSongsDirect(storefront, query, searchLimiter).catch((error) => {
-          if (isRateLimitError(error)) {
-            throw error;
-          }
-          return searchAppleSongsWithMusicKit(music, storefront, query, searchLimiter);
-        }).catch((error) => {
+        if (searchCache.size >= 1000) searchCache.delete(searchCache.keys().next().value);
+        const searchPromise = requestAppleCatalog(payload, searchLimiter).catch((error) => {
           searchCache.delete(cacheKey);
           throw error;
         });
@@ -1778,54 +1776,63 @@ export function renderAppHtml() {
       return searchCache.get(cacheKey);
     }
 
-    async function searchAppleSongsDirect(storefront, query, searchLimiter) {
-      const params = new URLSearchParams({
-        term: query,
-        types: "songs",
-        limit: String(SEARCH_RESULT_LIMIT)
-      });
-
+    async function requestAppleCatalog(payload, searchLimiter) {
       return runAppleSearchWithRetry("Apple catalog search", searchLimiter, async () => {
-        const response = await fetch("https://api.music.apple.com/v1/catalog/" + encodeURIComponent(storefront) + "/search?" + params.toString(), {
-          headers: {
-            Authorization: "Bearer " + state.developerToken
-          }
-        });
-
-        if (!response.ok) {
-          throw createAppleHttpError("Apple catalog search failed", response);
+        let response;
+        let result;
+        try {
+          response = await fetch("/apple/catalog", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(45000)
+          });
+          result = await response.json();
+        } catch {
+          const error = new Error("Apple catalog connection unavailable");
+          error.status = 503;
+          throw error;
         }
-
-        const payload = await response.json();
-        return payload && payload.results && payload.results.songs && Array.isArray(payload.results.songs.data)
-          ? payload.results.songs.data
-          : [];
+        if (!response.ok) {
+          const error = createAppleHttpError("Apple catalog search failed", response);
+          error.code = result.error && result.error.code;
+          if (result.error && result.error.details && Number.isFinite(result.error.details.retryAfterMs)) {
+            error.retryAfterMs = result.error.details.retryAfterMs;
+          }
+          throw error;
+        }
+        return Array.isArray(result.data) ? result.data : [];
       });
     }
 
-    async function searchAppleSongsWithMusicKit(music, storefront, query, searchLimiter) {
-      return runAppleSearchWithRetry("MusicKit search", searchLimiter, async () => {
-        const results = await music.api.search(query, {
-          types: "songs",
-          limit: SEARCH_RESULT_LIMIT,
-          storefront
-        });
-        return results && results.songs && Array.isArray(results.songs.data) ? results.songs.data : [];
-      });
+    function pauseForAppleSearch() {
+      const control = state.importControl;
+      if (!control || control.canceled || control.paused) return;
+      control.paused = true;
+      updateImportControlButtons();
+      setImportProgress(Number.parseInt(elements.importPercent.textContent, 10) || 0, "搜索暂时不可用，已暂停");
+      addLog(elements.importLog, "搜索重试后仍不可用，已暂停；当前歌曲尚未计入失败");
     }
 
     function createSearchLimiter(intervalMs) {
       let nextAt = 0;
+      let previousTurn = Promise.resolve();
 
       return {
         async waitTurn() {
-          await waitForImportTurn();
-          const now = Date.now();
-          const waitMs = Math.max(0, nextAt - now);
-          nextAt = Math.max(nextAt, now) + intervalMs;
-          if (waitMs > 0) {
-            await waitWithImportControl(waitMs);
-          }
+          const turn = previousTurn.then(async () => {
+            while (true) {
+              await waitForImportTurn();
+              const waitMs = nextAt - Date.now();
+              if (waitMs <= 0) {
+                nextAt = Date.now() + intervalMs;
+                return;
+              }
+              await waitWithImportControl(waitMs);
+            }
+          });
+          previousTurn = turn.catch(() => {});
+          await turn;
         },
         penalize(delayMs) {
           nextAt = Math.max(nextAt, Date.now() + delayMs);
@@ -1843,7 +1850,7 @@ export function renderAppHtml() {
           return await operation();
         } catch (error) {
           lastError = error;
-          if (!shouldRetryAppleSearch(error) || attempt >= SEARCH_MAX_RETRIES) {
+          if (!shouldRetryAppleSearch(error) || error.code === "apple_credentials_missing" || attempt >= SEARCH_MAX_RETRIES) {
             throw error;
           }
 
@@ -1868,10 +1875,6 @@ export function renderAppHtml() {
       return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
     }
 
-    function isRateLimitError(error) {
-      return getErrorStatus(error) === 429;
-    }
-
     function getErrorStatus(error) {
       if (!error) return null;
       if (Number.isFinite(error.status)) return error.status;
@@ -1883,7 +1886,7 @@ export function renderAppHtml() {
 
     function appleSearchRetryDelay(error, attempt) {
       if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) {
-        return Math.min(error.retryAfterMs, SEARCH_RETRY_MAX_MS);
+        return error.retryAfterMs;
       }
 
       const exponentialDelay = SEARCH_RETRY_BASE_MS * Math.pow(1.8, attempt);
@@ -1918,104 +1921,6 @@ export function renderAppHtml() {
         reason + "，自动重试中"
       );
       console.warn(label + " retry after " + delayMs + "ms");
-    }
-
-    function scoreCandidates(track, candidates) {
-      let best = null;
-      for (const candidate of candidates) {
-        const score = scoreCandidate(track, candidate);
-        if (!best || score > best.score) {
-          best = { ...candidate, score };
-        }
-      }
-      return best;
-    }
-
-    function buildSearchQueries(track) {
-      const firstArtist = track.artists[0] || "";
-      const allArtists = track.artists.join(" ");
-      return Array.from(new Set([
-        track.name + " " + firstArtist,
-        track.name + " " + allArtists,
-        track.name
-      ].map((query) => query.trim()).filter(Boolean)));
-    }
-
-    function scoreCandidate(track, candidate) {
-      const attributes = candidate.attributes || {};
-      const sourceTitle = normalizeText(track.name);
-      const candidateTitle = normalizeText(attributes.name);
-      const rawSourceTitle = String(track.name || "");
-      const rawCandidateTitle = String(attributes.name || "");
-      const sourceArtists = normalizeText(track.artists.join(" "));
-      const candidateArtist = normalizeText(attributes.artistName);
-      const sourceAlbum = normalizeText(track.album);
-      const candidateAlbum = normalizeText(attributes.albumName);
-      const sourceWantsEditedVersion = hasEditedVersionMarker(rawSourceTitle);
-      let score = 0;
-
-      if (sourceTitle && candidateTitle === sourceTitle) score += 0.48;
-      else if (sourceTitle && candidateTitle.includes(sourceTitle)) score += 0.34;
-      else score += tokenSimilarity(sourceTitle, candidateTitle) * 0.36;
-
-      if (sourceArtists && candidateArtist.includes(sourceArtists)) score += 0.26;
-      else if (sourceArtists && sourceArtists.split(" ").some((part) => part.length > 1 && candidateArtist.includes(part))) score += 0.2;
-      else score += tokenSimilarity(sourceArtists, candidateArtist) * 0.22;
-
-      if (track.durationMs && attributes.durationInMillis) {
-        const diff = Math.abs(track.durationMs - attributes.durationInMillis);
-        if (diff <= 2500) score += 0.16;
-        else if (diff <= 7000) score += 0.1;
-      }
-
-      if (sourceAlbum && candidateAlbum && (candidateAlbum.includes(sourceAlbum) || sourceAlbum.includes(candidateAlbum))) {
-        score += 0.06;
-      }
-
-      score += contentRatingScore(attributes.contentRating, sourceWantsEditedVersion);
-      if (!sourceWantsEditedVersion && hasEditedVersionMarker(rawCandidateTitle)) {
-        score -= EDITED_TITLE_PENALTY;
-      }
-
-      return score;
-    }
-
-    function contentRatingScore(contentRating, sourceWantsEditedVersion) {
-      const rating = String(contentRating || "").toLowerCase();
-      if (sourceWantsEditedVersion) {
-        return rating === "clean" ? 0.02 : 0;
-      }
-      if (rating === "explicit") {
-        return EXPLICIT_VERSION_BONUS;
-      }
-      if (rating === "clean") {
-        return -CLEAN_VERSION_PENALTY;
-      }
-      return 0;
-    }
-
-    function hasEditedVersionMarker(value) {
-      return /\\b(clean|edited|censored|radio edit|clean version|edited version)\\b|消音|和谐|洁版/i.test(String(value || ""));
-    }
-
-    function normalizeText(value) {
-      return String(value || "")
-        .toLowerCase()
-        .replace(/\\([^)]*\\)|\\[[^\\]]*\\]|（[^）]*）/g, " ")
-        .replace(/[^\\p{Letter}\\p{Number}]+/gu, " ")
-        .replace(/\\s+/g, " ")
-        .trim();
-    }
-
-    function tokenSimilarity(left, right) {
-      const leftTokens = new Set(left.split(" ").filter(Boolean));
-      const rightTokens = new Set(right.split(" ").filter(Boolean));
-      if (!leftTokens.size || !rightTokens.size) return 0;
-      let overlap = 0;
-      for (const token of leftTokens) {
-        if (rightTokens.has(token)) overlap += 1;
-      }
-      return overlap / Math.max(leftTokens.size, rightTokens.size);
     }
 
     async function createApplePlaylist(name, developerToken, musicUserToken, sourceName) {
@@ -2105,6 +2010,7 @@ export function renderAppHtml() {
     function resetImportMetrics() {
       elements.importLog.innerHTML = "";
       state.failedTracks = new Map();
+      state.failedTrackRows = new Map();
       elements.failedTrackTable.innerHTML = "";
       elements.failedListCount.textContent = "0";
       elements.failedPanel.hidden = true;
@@ -2124,7 +2030,7 @@ export function renderAppHtml() {
     }
 
     function setTrackStatus(trackId, label, type) {
-      const badge = document.querySelector("[data-import-status='" + trackId + "']");
+      const badge = state.trackBadges.get(String(trackId));
       if (!badge) return;
       badge.textContent = label;
       badge.className = "badge " + type;
@@ -2212,21 +2118,26 @@ export function renderAppHtml() {
         reason
       });
 
-      renderFailedTracks();
+      renderFailedTracks(key);
     }
 
-    function renderFailedTracks() {
-      const failures = Array.from(state.failedTracks.values()).sort((left, right) => left.index - right.index);
-      elements.failedPanel.hidden = failures.length === 0;
-      elements.failedListCount.textContent = String(failures.length);
-      elements.failedTrackTable.innerHTML = failures.map((track) => {
-        return "<tr>" +
-          "<td>" + track.index + "</td>" +
-          "<td>" + escapeHtml(track.name) + "</td>" +
-          "<td>" + escapeHtml(track.artists) + "</td>" +
-          "<td class=\\"muted\\">" + escapeHtml(track.reason) + "</td>" +
-        "</tr>";
-      }).join("");
+    function renderFailedTracks(key) {
+      const track = state.failedTracks.get(key);
+      if (!track) return;
+      elements.failedPanel.hidden = false;
+      elements.failedListCount.textContent = String(state.failedTracks.size);
+      let row = state.failedTrackRows.get(key);
+      if (!row) {
+        row = document.createElement("tr");
+        state.failedTrackRows.set(key, row);
+        elements.failedTrackTable.appendChild(row);
+      }
+      row.replaceChildren(...[track.index, track.name, track.artists, track.reason].map((value, index) => {
+        const cell = document.createElement("td");
+        cell.textContent = String(value);
+        if (index === 3) cell.className = "muted";
+        return cell;
+      }));
     }
 
     function addLog(container, text) {
