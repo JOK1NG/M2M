@@ -311,7 +311,13 @@ The browser matches up to eight tracks concurrently. Queued ISRC lookups can sha
 
 Matching progress shows recent 30-second and overall rates, excluding manual pauses. The recent log records browser catalog queries per completed track, server cache hits, the shared request interval, queue depth, and 429 responses. The catalog API also returns anonymous numeric `diagnostics`; these contain no user credentials or other users' search terms. Rate-limit recovery reduces the interval by 20% after four consecutive successful requests from the current recovery period, never below the configured base interval. Older in-flight responses cannot undo a newer cooldown. Cache and log sizes remain bounded; identical workload tests cover 1,000 cold queries, including the period after 400.
 
-When the correct title and singer are found but only a different version or substantially different duration is available, matching continues for the rest of the playlist. Before any playlist is created, the user can compare source and candidate metadata, confirm a candidate, skip a track, or skip all remaining alternatives. Candidates always come from the account region, and no automatic fallback imports a DJ version in place of an unmarked original.
+Chinese-context titles, singer credits, and albums are compared using OpenCC Traditional-to-Simplified conversion without changing the original metadata. Kana, Hangul, and Cyrillic contexts are not treated as Chinese. Authoritative source artist aliases and translated titles are searched in the account region before native-region fallbacks, with at most six distinct target queries and no exhaustive alias combinations. Conversion is local to the browser and its cache is bounded to 1,000 entries; no AI service or additional user data store is involved.
+
+When the correct title and singer are found but only a different version or substantially different duration is available, matching continues for the rest of the playlist. Distinctive same-title candidates with close duration and an unconfirmed cross-script singer credit can also be offered for review; independent album evidence can support ambiguous Han credits. Album and duration alone never automatically identify a different singer. Before any playlist is created, the user can compare source and candidate metadata, confirm a candidate, skip a track, or skip all remaining alternatives. Candidates always come from the account region, and no automatic fallback imports a DJ version in place of an unmarked original.
+
+`npm test` and Wrangler's custom build generate the self-contained browser matcher with `npm run build:matcher`. The ignored `dist/matcher-source.js` includes the dependency's MIT license and Apache-2.0 dictionary notices and needs no third-party script CDN. M2M's own license remains MIT.
+
+Unconfirmed native-region credits may assist a bounded ISRC lookup for review, but those recordings are not treated as verified source matches. Only matching ISRC responses from the account region become candidates; additional version conflicts and missing durations are rejected. Already fetched account recordings are reused, and an established review candidate needs at most one final account title-only check rather than an exhaustive alias search.
 
 Raise these limits only after validating queue behavior, upstream rate limits, and Apple Music import retries.
 
@@ -646,7 +652,13 @@ curl https://m2m.xinyu017722.workers.dev/health
 
 匹配进度同时显示近 30 秒速度和全程平均速度，扣除手动暂停时间。近期日志记录每首已处理歌曲的浏览器曲库查询次数、服务端缓存命中率、全站请求间隔、排队数量和 429 响应次数。曲库接口新增匿名数值 `diagnostics`，不含用户凭据或其他人的搜索词。限流后，当前恢复周期每连续成功四次，将间隔降低 20%，但不会低于配置的基础间隔；限流前发出的旧请求不能抵消新的冷却。缓存及日志数量保持有界，并用 1000 次等量冷查询验证了第 400 首之后的调度。
 
-找到同名同歌手、但版本或时长明显不同的候选时，系统继续匹配歌单剩余歌曲。创建 Apple 歌单之前，用户可对比源曲目与候选的元数据，确认选中版本、跳过这首或跳过剩余项。候选仅来自账号地区，未标明 DJ 的原版不会被自动替换成 DJ 版。
+中文上下文的歌名、歌手署名和专辑使用 OpenCC 繁转简后比较，不改动原始元数据；包含日文假名、韩文或西里尔字母的上下文不会被当成中文处理。优先在账号地区搜索源平台提供的歌手别名及译名，再进行原语言地区兜底；目标地区最多六个不同查询，不穷举所有别名组合。转换在浏览器本地完成，缓存最多 1000 项，不使用 AI 服务或新增用户数据存储。
+
+找到同名同歌手、但版本或时长明显不同的候选时，系统继续匹配歌单剩余歌曲。歌名完整对应、时长接近，但跨文字体系的歌手署名无法确认时，也可提供人工候选；独立专辑证据可辅助汉字署名的歧义判断。仅凭专辑和时长一致，不会自动接受不同歌手。创建 Apple 歌单之前，用户可对比源曲目与候选的元数据，确认选中曲目、跳过这首或跳过剩余项。候选仅来自账号地区，未标明 DJ 的原版不会被自动替换成 DJ 版。
+
+`npm test` 和 Wrangler 自定义构建会通过 `npm run build:matcher` 生成自包含的浏览器匹配脚本。忽略提交的 `dist/matcher-source.js` 保留依赖的 MIT 许可和 Apache-2.0 字典声明，不依赖第三方脚本 CDN；M2M 自身仍使用 MIT 协议。
+
+原语言地区署名尚未确认的录音可辅助有限的 ISRC 查询，但不会被当成已验证的源曲目。只有账号地区返回相同 ISRC 的录音才能成为人工候选；额外的版本冲突及缺失时长会被拒绝。复用已经取得的账号地区录音，形成待确认候选后最多再补查一次账号地区的纯歌名，不继续穷举别名。
 
 只有在验证队列行为、上游限流和 Apple Music 导入重试后，才建议提高这些限制。
 

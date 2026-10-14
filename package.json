@@ -5,12 +5,18 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build:matcher": "node scripts/build-matcher.mjs",
+    "pretest": "npm run build:matcher",
     "apple:token": "node scripts/generate-apple-developer-token.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "node --test test/*.test.js"
   },
   "devDependencies": {
+    "esbuild": "0.28.2",
     "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "opencc-js": "1.4.2"
   }
 }

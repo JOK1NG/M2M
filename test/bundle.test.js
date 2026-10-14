@@ -22,4 +22,10 @@ test("the browser matcher executes after Workers bundling with the deployment co
     storefront: "cn", search: async () => [{ id: "song", attributes: { name: "Song", artistName: "Artist" } }]
   });
   assert.equal(match.id, "song");
+  const chinese = await context.matcher.match({ name: "吹灭小山河", artists: ["司南"], durationMs: 180000 }, {
+    storefront: "cn", search: async () => [{ id: "traditional", attributes: {
+      name: "吹滅小山河", artistName: "司南", durationInMillis: 180000
+    } }]
+  });
+  assert.equal(chinese?.id, "traditional");
 });

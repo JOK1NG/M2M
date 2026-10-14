@@ -1,4 +1,4 @@
-import { createSongMatcher } from "./matching.js";
+import { MATCHER_BROWSER_SOURCE } from "../dist/matcher-source.js";
 
 export function renderAppHtml() {
   return `<!doctype html>
@@ -886,7 +886,7 @@ export function renderAppHtml() {
             <div class="log" id="importLog"></div>
             <section class="version-review" id="versionReviewPanel" hidden aria-labelledby="versionReviewTitle">
               <div class="status-line">
-                <h3 id="versionReviewTitle">确认其他版本</h3>
+                <h3 id="versionReviewTitle">确认候选曲目</h3>
                 <span id="versionReviewPosition"></span>
               </div>
               <p id="versionReviewSource"></p>
@@ -894,7 +894,7 @@ export function renderAppHtml() {
               <p class="field-hint" id="versionReviewReason"></p>
               <div class="version-candidates" id="versionReviewCandidates"></div>
               <div class="toolbar">
-                <button class="button" id="confirmVersion" type="button" disabled>确认选中版本</button>
+                <button class="button" id="confirmVersion" type="button" disabled>确认选中曲目</button>
                 <button class="button secondary" id="skipVersion" type="button">跳过这首</button>
                 <button class="button secondary" id="skipAllVersions" type="button">跳过剩余</button>
               </div>
@@ -965,7 +965,8 @@ export function renderAppHtml() {
     const SEARCH_RETRY_MAX_MS = 15000;
     const PLAYLIST_NAME_MAX_LENGTH = 100;
     const APPLE_AUTH_TIMEOUT_MS = 90000;
-    const songMatcher = (${createSongMatcher.toString()})();
+    ${MATCHER_BROWSER_SOURCE}
+    const songMatcher = M2MSongMatcher.createSongMatcher();
     const QUEUE_POLL_MS = 3000;
     const QUEUE_HEARTBEAT_MS = 12000;
 
@@ -1862,7 +1863,7 @@ export function renderAppHtml() {
       const labels = {
         no_results: "Apple Music 搜索未返回歌曲",
         title_mismatch: "已搜到歌曲，但歌名无法可靠对应",
-        artist_mismatch: "已搜到同名歌曲，但歌手无法可靠对应",
+        artist_mismatch: "已找到候选，但歌手署名无法可靠对应",
         duration_mismatch: "同名同歌手候选的时长差超过 15 秒",
         version_mismatch: "已找到其他版本，需要确认",
         low_confidence: "已找到候选，但匹配可信度不足",
@@ -1945,7 +1946,7 @@ export function renderAppHtml() {
         label.append(input, copy);
         return label;
       }));
-      setImportProgress(70, "待确认其他版本 " + remaining + " 首");
+      setImportProgress(70, "待确认曲目 " + remaining + " 首");
     }
 
     function selectVersionCandidate(index) {
@@ -1969,7 +1970,7 @@ export function renderAppHtml() {
         setTrackStatus(row.source.id, "已确认", "ok");
       } else {
         row.status = "not_found";
-        row.reason = "已跳过其他版本：" + row.reason;
+        row.reason = "已跳过候选曲目：" + row.reason;
         review.summary.failed += 1;
         recordFailedTrack(row.source, row.reason);
         setTrackStatus(row.source.id, "已跳过", "fail");

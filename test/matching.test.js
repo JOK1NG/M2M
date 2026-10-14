@@ -150,12 +150,12 @@ test("propagates transient catalog errors instead of calling them missing songs"
 });
 
 test("an unavailable auxiliary catalog does not discard a valid target-region match", async () => {
-  const source = track("歌", ["歌手あ"], { album: "同じアルバム" });
+  const source = track("歌", ["歌手あ"], { album: "同じアルバム", artistAliases: ["Translated artist"], durationMs: 202000 });
   const result = await matcher.match(source, {
     storefront: "cn",
     search: async storefront => {
       if (storefront === "jp") throw Object.assign(new Error("Unavailable region"), { status: 404 });
-      return [song("cn", "歌", "Translated artist", { albumName: "同じアルバム" })];
+      return [song("cn", "歌", "Translated artist", { albumName: "同じアルバム", contentRating: "clean" })];
     },
     resolveIsrc: async () => []
   });
@@ -504,22 +504,24 @@ test("credited-band windows do not invent an artist by concatenating separate pa
   }
 });
 
-test("retains the CN localized Han live recording using independent album and duration evidence", async () => {
+test("requires confirmation for an unverified localized Han credit despite independent album and duration evidence", async () => {
   const source = track("The Legend of Ashitaka", ["久石譲"], {
     album: "WORKS II -Orchestra Nights- (Live)", durationMs: 335160
   });
   const candidate = song("1498699599", "The Legend of Ashitaka (Symphonic Suite \"Princess Mononoke\" / Live)", "久石让", {
     albumName: "WORKS II - Orchestra Nights (Live)", durationInMillis: 335160, isrc: "JPPO09904860"
   });
-  assert.equal(matcher.scoreCandidates(source, [candidate])?.id, "1498699599");
+  assert.equal(matcher.scoreCandidates(source, [candidate]), null);
   assert.deepEqual(matcher.inspectCandidate(source, candidate), {
-    score: 0.74, reason: null, titleSimilarity: 1, artistSimilarity: 0, durationDifferenceMs: 0
+    score: 0, reason: "artist_mismatch", titleSimilarity: 1, artistSimilarity: 0, durationDifferenceMs: 0
   });
+  const notices = [];
   const result = await matcher.match(source, {
     storefront: "cn", search: async region => region === "cn" ? [candidate] : [], resolveIsrc: async () => [],
-    onUnmatched: () => assert.fail("The independently supported localized live recording is available")
+    onUnmatched: notice => notices.push(notice)
   });
-  assert.equal(result?.id, "1498699599");
+  assert.equal(result, null);
+  assert.equal(notices[0].candidates[0].id, "1498699599");
 });
 
 test("a self-titled album or single is not independent identity evidence for a wrong singer", () => {
@@ -810,14 +812,334 @@ test("direct source ISRC resolution stays in the account region and preserves ex
   assert.equal(result.matchMethod, "isrc");
 });
 
-test("the serialized factory exports inspectCandidate and works without external dependencies", async () => {
-  const serialized = Function("return (" + createSongMatcher.toString() + ")()")();
-  assert.equal(typeof serialized.inspectCandidate, "function");
+test("the matcher factory exposes inspection and requires explicit version confirmation", async () => {
+  const instance = createSongMatcher();
+  assert.equal(typeof instance.inspectCandidate, "function");
   const example = reportedCases[0];
-  assert.equal(serialized.inspectCandidate(example.source, example.candidate).reason, "version_mismatch");
+  assert.equal(instance.inspectCandidate(example.source, example.candidate).reason, "version_mismatch");
   const notices = [];
-  assert.equal(await serialized.match(example.source, {
+  assert.equal(await instance.match(example.source, {
     storefront: "us", search: async () => [example.candidate], onUnmatched: notice => notices.push(notice)
   }), null);
   assert.equal(notices[0].candidates[0].confirmationReason, "version_mismatch");
+});
+
+test("matches Chinese traditional titles, singer credits and albums without changing source metadata", async () => {
+  const source = track("吹灭小山河", ["司南"], { album: "国风音乐合集", durationMs: 194120 });
+  const original = structuredClone(source);
+  const candidate = song("traditional", "吹滅小山河", "司南", { albumName: "國風音樂合集" });
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "cn", search: async region => { calls.push(region); return [candidate]; },
+    resolveIsrc: async () => assert.fail("A supported traditional title needs no native catalog")
+  });
+  assert.equal(result?.id, "traditional");
+  assert.deepEqual(calls, ["cn"]);
+  assert.deepEqual(source, original);
+  assert.equal(matcher.inspectCandidate(track("说好的幸福呢", ["周杰伦"]),
+    song("traditional-artist", "說好的幸福呢", "周杰倫 & Guest")).artistSimilarity, 1);
+});
+
+test("Chinese conversion does not reinterpret Japanese names or remove recording version differences", () => {
+  assert.equal(matcher.scoreCandidates(track("後ろ姿", ["歌手"], { album: "日本の歌" }), [
+    song("not-the-same", "后ろ姿", "歌手")
+  ]), null);
+  assert.equal(matcher.inspectCandidate(track("吹灭小山河", ["司南"]),
+    song("dj", "吹滅小山河 (DJ版)", "司南")).reason, "version_mismatch");
+  assert.equal(matcher.inspectCandidate(track("同名歌曲", ["周杰伦"]),
+    song("wrong-artist", "同名歌曲", "林俊傑")).reason, "artist_mismatch");
+  assert.equal(matcher.scoreCandidates(track("中文歌", ["歌手"], { aliases: ["廣島の歌"] }), [
+    song("not-a-chinese-variant", "广島の歌", "歌手")
+  ]), null);
+});
+
+test("Chinese normalization alone without duration or independent album evidence cannot identify a recording", () => {
+  const source = { name: "发", artists: ["歌手"], album: "发" };
+  assert.equal(matcher.scoreCandidates(source, [{ id: "ambiguous", attributes: {
+    name: "髮", artistName: "歌手", albumName: "髮"
+  } }]), null);
+});
+
+test("queries an authoritative singer alias in the account catalog before native fallback", async () => {
+  const source = track("Known Recording", ["加藤いづみ"], { artistAliases: ["Izumi Kato"] });
+  const calls = [];
+  const queries = matcher.buildSearchQueries(source);
+  assert.ok(queries.includes("Known Recording Izumi Kato"));
+  assert.ok(queries.length <= 6);
+  const result = await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      calls.push({ region, query });
+      return query === "Known Recording Izumi Kato" ? [song("alias", source.name, "Izumi Kato")] : [];
+    },
+    resolveIsrc: async () => assert.fail("Known artist aliases do not need a cross-region lookup")
+  });
+  assert.equal(result?.id, "alias");
+  assert.deepEqual(calls.map(call => call.region), ["us", "us"]);
+});
+
+test("queries a translated title alias before native lookup without expanding every alias combination", async () => {
+  const source = track("原始歌名", ["Artist"], { aliases: ["Verified Title", "Another Title", "Extra Title"],
+    artistAliases: ["Artist", "Another Credit", "Third Credit", "Fourth Credit"] });
+  const queries = matcher.buildSearchQueries(source);
+  assert.ok(queries.length <= 6);
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      calls.push({ region, query });
+      return query === "Verified Title Artist" ? [song("translated", "Verified Title", "Artist")] : [];
+    },
+    resolveIsrc: async () => []
+  });
+  assert.equal(result?.id, "translated");
+  assert.ok(calls.every(call => call.region === "us"));
+  assert.ok(calls.length <= 3);
+});
+
+test("offers a distinctive same-title cross-script artist candidate only for explicit confirmation", async () => {
+  const source = track("Kamura's Song of Purification", ["加藤いづみ"], {
+    album: "Source soundtrack", durationMs: 194120
+  });
+  const candidate = song("uncertain-credit", source.name, "Izumi Kato", { albumName: "Target soundtrack" });
+  const notices = [];
+  const result = await matcher.match(source, {
+    storefront: "cn", search: async region => region === "cn" ? [candidate] : [],
+    resolveIsrc: async () => [], onUnmatched: notice => notices.push(notice)
+  });
+  assert.equal(result, null);
+  assert.equal(matcher.scoreCandidate(source, candidate), 0);
+  assert.equal(notices[0].reason, "artist_mismatch");
+  assert.deepEqual(notices[0].candidates.map(item => item.id), ["uncertain-credit"]);
+});
+
+test("artist-uncertainty review rejects same-script conflicts, known contradictory aliases, versions and weak titles", async () => {
+  for (const [source, candidate] of [
+    [track("Distinctive Recording", ["Artist"]), song("conflict", "Distinctive Recording", "Another Artist")],
+    [track("Distinctive Recording", ["加藤いづみ"], { artistAliases: ["Izumi Kato"] }),
+      song("conflict", "Distinctive Recording", "Another Artist")],
+    [track("Distinctive Recording", ["加藤いづみ"]), song("version", "Distinctive Recording (DJ版)", "Izumi Kato")],
+    [track("Pages", ["加藤いづみ"], { album: "Source" }), song("short", "Pages", "Izumi Kato", { albumName: "Target" })],
+    [track("Distinctive Recording", ["加藤いづみ"]),
+      song("duration", "Distinctive Recording", "Izumi Kato", { durationInMillis: 220000 })]
+  ]) {
+    const notices = [];
+    assert.equal(await matcher.match(source, { storefront: "cn", search: async () => [candidate],
+      onUnmatched: notice => notices.push(notice) }), null);
+    assert.deepEqual(notices[0].candidates, [], candidate.id);
+  }
+});
+
+test("native identification retains the original title-only query despite target alias priorities", async () => {
+  const source = track("原語の曲", ["歌手あ"], { aliases: ["Translated Title", "Another Title"] });
+  const isrc = "JPAAA1200001";
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      calls.push({ region, query });
+      return region === "jp" && query === source.name ? [song("native", source.name, "歌手あ", { isrc })] : [];
+    }, resolveIsrc: async () => [song("account", "Translated Title", "Localized Singer", { isrc })]
+  });
+  assert.equal(result?.id, "account");
+  assert.deepEqual(calls.filter(call => call.region === "jp").map(call => call.query), [source.name + " 歌手あ", source.name]);
+});
+
+test("an exact target title with unconfirmed artist goes directly to native ISRC proof rather than redundant translated aliases", async () => {
+  const source = track("Distinctive Recording", ["歌手あ"], { aliases: ["译名一", "译名二"] });
+  const isrc = "JPAAA1200001";
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us", search: async region => {
+      calls.push(region);
+      return [song(region, source.name, region === "us" ? "Localized Singer" : "歌手あ", { isrc })];
+    }, resolveIsrc: async () => assert.fail("Verified recording is already in target candidates")
+  });
+  assert.equal(result?.id, "us");
+  assert.deepEqual(calls, ["us", "jp"]);
+});
+
+test("independent album and exact duration can offer an unverified band versus vocalist credit but never auto-match it", async () => {
+  const source = track("蘇る記憶", ["Ether"], { album: "深海都市セラノフィリア", durationMs: 346801 });
+  const candidate = song("singer-credit", source.name, "Erum Nagi", { albumName: source.album, durationInMillis: 346802 });
+  const notices = [];
+  assert.equal(await matcher.match(source, { storefront: "cn", search: async region => region === "cn" ? [candidate] : [],
+    resolveIsrc: async () => [], onUnmatched: notice => notices.push(notice) }), null);
+  assert.equal(matcher.scoreCandidate(source, candidate), 0);
+  assert.equal(notices[0].candidates[0]?.id, "singer-credit");
+  const conflicting = { ...source, artistAliases: ["Verified Ether Credit"] };
+  const conflicts = [];
+  assert.equal(await matcher.match(conflicting, { storefront: "cn", search: async () => [candidate],
+    onUnmatched: notice => conflicts.push(notice) }), null);
+  assert.deepEqual(conflicts[0].candidates, []);
+});
+
+test("traditional Chinese recording markers never silently substitute instrumental or slowed versions", () => {
+  const source = track("吹灭小山河", ["司南"]);
+  for (const suffix of ["純音樂", "減速版", "現場版"]) {
+    const candidate = song("different-version", "吹滅小山河 (" + suffix + ")", "司南");
+    assert.equal(matcher.scoreCandidate(source, candidate), 0, suffix);
+    assert.equal(matcher.inspectCandidate(source, candidate).reason, "version_mismatch", suffix);
+  }
+  const cleanSource = track("歌曲 (潔版)", ["歌手"]);
+  assert.equal(matcher.scoreCandidates(cleanSource, [song("explicit", "歌曲", "歌手", { contentRating: "explicit" }),
+    song("clean", "歌曲", "歌手", { contentRating: "clean" })])?.id, "clean");
+});
+
+test("an alias-only DJ alternative cannot suppress native proof of an available original", async () => {
+  const source = track("Original Recording", ["歌手あ"], { aliases: ["Localized Title"] });
+  const isrc = "JPAAA1200001";
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      calls.push(region);
+      return region === "us" ? (query.startsWith(source.name) ? [] : [song("dj", "Localized Title (DJ版)", "歌手あ")])
+        : [song("native", source.name, "歌手あ", { isrc })];
+    }, resolveIsrc: async () => [song("original", "Localized Title", "歌手あ", { isrc })]
+  });
+  assert.equal(result?.id, "original");
+  assert.ok(calls.includes("jp"));
+});
+
+test("credit separators and mixed collaborations do not disguise known same-script artist conflicts", async () => {
+  const source = track("Distinctive Recording", ["周杰伦"], { album: "Source soundtrack" });
+  for (const artist of ["林俊傑 feat. 王力宏", "林俊傑 ft. 王力宏", "林俊傑 & Guest"]) {
+    const notices = [];
+    assert.equal(await matcher.match(source, {
+      storefront: "cn", search: async () => [song("wrong", source.name, artist, { albumName: "Target soundtrack" })],
+      onUnmatched: notice => notices.push(notice)
+    }), null);
+    assert.deepEqual(notices[0].candidates, [], artist);
+  }
+});
+
+test("ambiguous native credits can map a recording into the account region for review without automatic acceptance", async () => {
+  const source = track("Distinctive Recording", ["歌手あ"], { album: "独立原声带" });
+  const isrc = "JPAAA1200001";
+  const native = song("native-only", source.name, "Publishing Band", { albumName: source.album, isrc });
+  const account = song("account-review", "Localized Recording", "Localized Vocalist", { albumName: "Localized soundtrack", isrc });
+  const notices = [];
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "cn", search: async region => { calls.push(region); return region === "jp" ? [native] : []; },
+    resolveIsrc: async (region, codes) => {
+      assert.equal(region, "cn");
+      assert.deepEqual(codes, [isrc]);
+      return [account];
+    }, onUnmatched: notice => notices.push(notice)
+  });
+  assert.equal(result, null);
+  assert.equal(notices[0].reason, "artist_mismatch");
+  assert.deepEqual(notices[0].candidates.map(item => item.id), ["account-review"]);
+  assert.deepEqual(calls, ["cn", "jp", "cn"]);
+});
+
+test("review mapping rejects unrelated ISRCs, missing durations and recordings with conflicting versions", async () => {
+  const source = track("Distinctive Recording", ["歌手あ"], { album: "独立原声带" });
+  const isrc = "JPAAA1200001";
+  for (const extra of [{ isrc: "USAAA1200001" }, { durationInMillis: 0 }, { name: "Localized Recording (DJ版)" }]) {
+    const notices = [];
+    const result = await matcher.match(source, {
+      storefront: "cn", search: async region => region === "jp" ? [song("native-only", source.name, "Publishing Band", {
+        albumName: source.album, isrc
+      })] : [], resolveIsrc: async () => [song("bad", "Localized Recording", "Localized Vocalist", { isrc, ...extra })],
+      onUnmatched: notice => notices.push(notice)
+    });
+    assert.equal(result, null);
+    assert.deepEqual(notices[0].candidates, []);
+  }
+});
+
+test("same-recording review can tolerate omitted locale version labels but not additional versions", async () => {
+  const source = track("Distinctive Recording (Live)", ["歌手あ"], { album: "独立现场原声带" });
+  const isrc = "JPAAA1200001";
+  const notices = [];
+  assert.equal(await matcher.match(source, {
+    storefront: "cn", search: async region => region === "jp" ? [song("native", source.name, "Publishing Band", {
+      albumName: source.album, isrc
+    })] : [], resolveIsrc: async () => [song("account", "Localized Recording", "Localized Vocalist", { isrc })],
+    onUnmatched: notice => notices.push(notice)
+  }), null);
+  assert.equal(notices[0].candidates[0]?.id, "account");
+});
+
+test("traditional version labels remain meaningful on Japanese songs without converting Japanese titles", () => {
+  const source = track("日本の歌", ["歌手あ"]);
+  for (const suffix of ["純音樂", "減速版"]) {
+    assert.equal(matcher.scoreCandidate(source, song("wrong", source.name + " (" + suffix + ")", "歌手あ")), 0);
+  }
+});
+
+test("query budgets use normalized lengths and review fallback never submits an oversized original title", async () => {
+  const oversized = "ﬃ".repeat(90);
+  assert.ok(matcher.buildSearchQueries(track(oversized, ["Artist"]))
+    .every(query => query.normalize("NFKC").length <= 256));
+  const source = track("x".repeat(300), ["歌手あ"], { aliases: ["Safe Recording"], album: "独立原声带" });
+  const isrc = "JPAAA1200001";
+  const notices = [];
+  assert.equal(await matcher.match(source, {
+    storefront: "cn", search: async (region, query) => {
+      assert.ok(query.normalize("NFKC").length <= 256);
+      return region === "jp" ? [song("native", "Safe Recording", "Publishing Band", { albumName: source.album, isrc })] : [];
+    }, resolveIsrc: async () => [song("account", "Localized Recording", "Localized Vocalist", { isrc })],
+    onUnmatched: notice => notices.push(notice)
+  }), null);
+  assert.equal(notices[0].candidates[0]?.id, "account");
+});
+
+test("1000 alternating Chinese and authoritative-alias tracks maintain bounded query counts", async () => {
+  const instance = createSongMatcher();
+  let requests = 0;
+  for (let index = 0; index < 1000; index += 1) {
+    const chinese = index % 2 === 0;
+    const source = chinese ? track("吹灭小山河 " + index, ["周杰伦"])
+      : track("Known Recording " + index, ["歌手あ"], { artistAliases: ["Known Singer"] });
+    const result = await instance.match(source, {
+      storefront: "cn", search: async (region, query) => {
+        assert.equal(region, "cn");
+        requests += 1;
+        if (!chinese && !query.endsWith(" Known Singer")) return [];
+        return [song(String(index), chinese ? "吹滅小山河 " + index : source.name, chinese ? "周杰倫" : "Known Singer")];
+      }, resolveIsrc: async () => assert.fail("Canonical names and known aliases need no cross-region proof")
+    });
+    assert.equal(result?.id, String(index));
+  }
+  assert.equal(requests, 1500);
+});
+
+test("mapping retains a same-recording version proof when the account candidate was already searched", async () => {
+  const source = track("Distinctive Recording (Live)", ["歌手あ"], { aliases: ["Localized Recording"], album: "Source soundtrack" });
+  const isrc = "JPAAA1200001";
+  const account = song("account", "Localized Recording", "Localized Vocalist", { albumName: "Account soundtrack", isrc });
+  const notices = [];
+  assert.equal(await matcher.match(source, {
+    storefront: "cn", search: async region => region === "jp"
+      ? [song("native", source.name, "Publishing Band", { albumName: "Native soundtrack", isrc })] : [account],
+    resolveIsrc: async () => [account], onUnmatched: notice => notices.push(notice)
+  }), null);
+  assert.deepEqual(notices[0].candidates.map(candidate => candidate.id), ["account"]);
+});
+
+test("release suffixes cannot turn generic album names into recording identity evidence", async () => {
+  for (const album of ["Unknown Album - Single", "OST - EP", "Album - Single - EP", "未知专辑 - Single"]) {
+    const source = track("Song", ["歌手あ"], { album });
+    const notices = [];
+    assert.equal(await matcher.match(source, { storefront: "cn", search: async () => [song("wrong", source.name, "Another Singer", {
+      albumName: album
+    })], onUnmatched: notice => notices.push(notice) }), null);
+    assert.deepEqual(notices[0].candidates, [], album);
+  }
+});
+
+test("failed ambiguous mapping has one shared budget of three recording codes per track", async () => {
+  const source = track("Distinctive Recording", ["中文歌手"], { album: "Source soundtrack" });
+  let nativeQuery = 0;
+  let lookupCodes = 0;
+  assert.equal(await matcher.match(source, {
+    storefront: "us", search: async region => {
+      if (region === "us") return [];
+      const start = nativeQuery++ * 3;
+      return Array.from({ length: 3 }, (_, index) => song("native-" + (start + index), source.name, "Unknown Singer", {
+        albumName: "Native soundtrack", isrc: "JPAAA" + String(1200001 + start + index)
+      }));
+    }, resolveIsrc: async (_region, codes) => { lookupCodes += codes.length; return []; }
+  }), null);
+  assert.equal(lookupCodes, 3);
 });

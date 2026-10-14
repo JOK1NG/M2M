@@ -251,7 +251,7 @@ function reviewFunctions() {
     setAttribute(name, value) { this[name] = value; }
   });
   const elements = Object.fromEntries(["versionReviewPanel", "versionReviewPosition", "versionReviewSource", "versionReviewMetadata",
-    "versionReviewReason", "versionReviewCandidates", "confirmVersion", "skipVersion", "skipAllVersions", "importMatched", "importFailed", "importLog", "appStatus"]
+    "versionReviewReason", "versionReviewCandidates", "confirmVersion", "skipVersion", "skipAllVersions", "importTotal", "importMatched", "importSucceeded", "importFailed", "importLog", "appStatus"]
     .map(name => [name, node()]));
   const context = vm.createContext({ Array, Promise, Number, Math, String, URL, Date, Error,
     document: { createElement(tag) { const element = node(tag); created.push(element); return element; } },
@@ -262,7 +262,7 @@ function reviewFunctions() {
     createImportCanceledError: () => Object.assign(new Error("Canceled"), { name: "ImportCanceledError" }) });
   const section = script.slice(script.indexOf("    function unmatchedReason("), script.indexOf("    async function findAppleSong("));
   vm.runInContext(section, context);
-  return { context, elements, created };
+  return { script, context, elements, created };
 }
 
 function pendingRow(id = 1) {
@@ -279,6 +279,106 @@ async function waitForReview(context) {
   for (let turn = 0; turn < 20 && !context.state.versionReview; turn += 1) await Promise.resolve();
   assert.ok(context.state.versionReview);
 }
+
+test("manual review renders generic candidate and track confirmation labels", () => {
+  const html = renderAppHtml();
+  const panel = html.match(/<section[^>]*id="versionReviewPanel"[\s\S]*?<\/section>/)[0];
+  assert.match(panel, /<h3 id="versionReviewTitle">确认候选曲目<\/h3>/);
+  assert.match(panel, /<button[^>]*id="confirmVersion"[^>]*disabled>确认选中曲目<\/button>/);
+});
+
+test("artist identity candidates wait for matching and explicit confirmation before import", async () => {
+  const { script, context, elements, created } = reviewFunctions();
+  const section = script.slice(script.indexOf("    function createMatchMeter("), script.indexOf("    async function findAppleSong("));
+  vm.runInContext(section, context);
+  context.MATCH_CONCURRENCY = 1;
+  context.SEARCH_REQUEST_INTERVAL_MS = 80;
+  context.state.catalogCache = new Map();
+  context.createSearchLimiter = () => ({});
+  context.catalogMetricsText = () => "";
+  context.recordFailedTrack = () => assert.fail("An unconfirmed artist is not a failed match");
+  const first = pendingRow(1).source;
+  const second = pendingRow(2).source;
+  const candidate = pendingRow().candidates[0];
+  candidate.confirmationReason = "artist_mismatch";
+  candidate.attributes.artistName = "Unconfirmed Artist";
+  candidate.attributes.durationInMillis = first.durationMs;
+  let finishMatching;
+  const lastMatch = new Promise(resolve => { finishMatching = resolve; });
+  let reachedLastTrack;
+  const matchingLastTrack = new Promise(resolve => { reachedLastTrack = resolve; });
+  context.findAppleSong = async (_music, _region, source, _cache, _limiter, onUnmatched) => {
+    if (source.id === first.id) {
+      onUnmatched({ reason: "artist_mismatch", candidates: [candidate] });
+      return null;
+    }
+    reachedLastTrack();
+    return lastMatch;
+  };
+  const progress = [];
+  context.setImportProgress = (percent, label) => { progress.push({ percent, label }); };
+  const imports = [];
+  context.createApplePlaylist = async () => { imports.push("create"); return "playlist"; };
+  context.addTracksToApplePlaylist = async (_playlistId, rows) => {
+    imports.push("add");
+    assert.deepEqual(Array.from(rows, row => row.source.id), [1, 2]);
+    assert.deepEqual(Array.from(rows, row => row.apple.id), ["alternative", "automatic"]);
+    return { succeeded: rows.length, failed: 0 };
+  };
+  const operation = context.importToAppleMusic({ storefrontId: "cn" }, { tracks: [first, second] }, "Playlist");
+  await matchingLastTrack;
+  assert.equal(elements.versionReviewPanel.hidden, true);
+  assert.ok(!context.state.versionReview);
+  assert.deepEqual(imports, []);
+  finishMatching({ id: "automatic", type: "songs" });
+  await waitForReview(context);
+  const review = context.state.versionReview;
+  const row = review.rows[0];
+  assert.equal(row.status, "needs_review");
+  assert.equal(row.apple, null);
+  assert.equal(review.selectedIndex, -1);
+  assert.equal(review.summary.matched, 1);
+  assert.equal(review.summary.failed, 0);
+  assert.equal(review.summary.pending, 1);
+  assert.equal(elements.confirmVersion.disabled, true);
+  assert.match(elements.versionReviewReason.textContent, /歌手署名无法可靠对应/);
+  assert.ok(created.some(element => element.textContent.includes("歌手署名无法可靠对应")));
+  assert.ok(created.filter(element => element.type === "radio").every(element => !element.checked));
+  context.completeVersionChoice(false);
+  assert.equal(row.apple, null);
+  assert.deepEqual(imports, []);
+  context.selectVersionCandidate(0);
+  assert.equal(elements.confirmVersion.disabled, false);
+  assert.equal(row.apple, null);
+  assert.deepEqual(imports, []);
+  context.completeVersionChoice(false);
+  await operation;
+  assert.equal(row.apple, candidate);
+  assert.equal(row.confirmed, true);
+  assert.deepEqual(imports, ["create", "add"]);
+  assert.equal(context.state.versionReview, null);
+  assert.equal(elements.versionReviewPanel.hidden, true);
+  assert.ok(progress.some(update => update.percent === 70 && update.label === "待确认曲目 1 首"));
+});
+
+test("skipping an artist identity candidate records a generic failure with the artist reason", async () => {
+  const { context } = reviewFunctions();
+  const row = pendingRow();
+  row.reason = context.unmatchedReason("artist_mismatch", "cn");
+  row.candidates[0].confirmationReason = "artist_mismatch";
+  const failures = [];
+  context.recordFailedTrack = (source, reason) => { failures.push({ source, reason }); };
+  const summary = { matched: 0, failed: 0, pending: 1 };
+  const operation = context.reviewMatchedRows([row], summary);
+  await waitForReview(context);
+  assert.equal(failures.length, 0);
+  context.completeVersionChoice(true);
+  await operation;
+  assert.equal(row.apple, null);
+  assert.equal(row.status, "not_found");
+  assert.deepEqual(summary, { matched: 0, failed: 1, pending: 0 });
+  assert.deepEqual(failures, [{ source: row.source, reason: "已跳过候选曲目：已找到候选，但歌手署名无法可靠对应" }]);
+});
 
 test("manual confirmation requires an explicit selection and preserves the source track order", async () => {
   const { context, elements } = reviewFunctions();
