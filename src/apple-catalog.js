@@ -61,6 +61,8 @@ export class AppleCatalogService {
     this.interval = this.baseInterval;
     this.lastStartedAt = -Infinity;
     this.cooldownUntil = 0;
+    this.rateLimitEvents = 0;
+    this.recoveryStreak = 0;
     this.active = 0;
     this.draining = false;
     this.queue = [];
@@ -70,7 +72,9 @@ export class AppleCatalogService {
     this.tokenPromise = null;
   }
 
-  async request(payload) {
+  async request(payload, options = {}) {
+    const startedAt = this.now();
+    const includeDiagnostics = options?.diagnostics === true;
     const normalized = normalizeCatalogRequest(payload);
     const key = JSON.stringify(normalized);
     const cached = this.cache.get(key);
@@ -78,7 +82,7 @@ export class AppleCatalogService {
       this.cache.delete(key);
       if (cached.expiresAt > this.now()) {
         this.cache.set(key, cached);
-        return { data: structuredClone(cached.data), cacheHit: true };
+        return this.requestResult(cached.data, true, startedAt, includeDiagnostics);
       }
     }
 
@@ -105,7 +109,23 @@ export class AppleCatalogService {
       this.queue.push({ normalized, resolve, reject });
       this.drain();
     }
-    return { data: structuredClone(await operation), cacheHit: false };
+    return this.requestResult(await operation, false, startedAt, includeDiagnostics);
+  }
+
+  requestResult(data, cacheHit, startedAt, includeDiagnostics) {
+    const result = { data: structuredClone(data), cacheHit };
+    if (includeDiagnostics) {
+      const now = this.now();
+      result.diagnostics = {
+        elapsedMs: Math.max(0, now - startedAt),
+        intervalMs: this.interval,
+        queueDepth: this.queue.length,
+        activeRequests: this.active,
+        cooldownMs: Math.max(0, this.cooldownUntil - now),
+        rateLimitEvents: this.rateLimitEvents
+      };
+    }
+    return result;
   }
 
   async drain() {
@@ -124,6 +144,7 @@ export class AppleCatalogService {
         try {
           developerToken = await this.getDeveloperToken();
         } catch (error) {
+          this.recoveryStreak = 0;
           this.queue.shift();
           job.reject(error);
           continue;
@@ -189,6 +210,8 @@ export class AppleCatalogService {
   }
 
   async send(normalized, developerToken) {
+    const epoch = this.rateLimitEvents;
+    const startedAt = this.now();
     const controller = new AbortController();
     let timer;
     const deadline = new Promise((_resolve, reject) => {
@@ -201,8 +224,17 @@ export class AppleCatalogService {
       const data = await Promise.race([
         this.fetchSongs(normalized, developerToken, controller.signal), deadline
       ]);
-      this.interval = Math.max(this.baseInterval, this.interval - 25);
+      if (epoch === this.rateLimitEvents && startedAt >= this.cooldownUntil && this.interval > this.baseInterval) {
+        this.recoveryStreak += 1;
+        if (this.recoveryStreak >= 4) {
+          this.interval = Math.max(this.baseInterval, Math.ceil(this.interval * 0.8));
+          this.recoveryStreak = 0;
+        }
+      }
       return data;
+    } catch (error) {
+      if (epoch === this.rateLimitEvents) this.recoveryStreak = 0;
+      throw error;
     } finally {
       clearTimeout(timer);
     }
@@ -231,6 +263,8 @@ export class AppleCatalogService {
     if (response.status === 429) {
       const now = this.now();
       const retryAfterMs = parseRetryAfter(response.headers?.get("Retry-After"), now);
+      this.rateLimitEvents += 1;
+      this.recoveryStreak = 0;
       this.cooldownUntil = Math.max(this.cooldownUntil, now + retryAfterMs);
       this.interval = Math.max(this.baseInterval, Math.min(3000, this.interval * 2));
       throw new AppleError(429, "apple_rate_limited", "Apple Music catalog is temporarily rate limited.", {

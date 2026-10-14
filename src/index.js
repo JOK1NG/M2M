@@ -306,7 +306,7 @@ async function handleAppleCatalog(request, env) {
     return result;
   }
   if (!localCatalogService) localCatalogService = new AppleCatalogService(env);
-  return jsonResponse(await localCatalogService.request(normalized), 200, request, env);
+  return jsonResponse(await localCatalogService.request(normalized, { diagnostics: true }), 200, request, env);
 }
 
 async function readCatalogBody(request) {

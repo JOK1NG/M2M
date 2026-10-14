@@ -401,6 +401,12 @@ export function renderAppHtml() {
       max-height: 420px;
     }
 
+    .failed-table-wrap table { table-layout: fixed; }
+    .failed-table-wrap th:first-child { width: 52px; }
+    .failed-table-wrap th:nth-child(2) { width: 27%; }
+    .failed-table-wrap th:nth-child(3) { width: 25%; }
+    .failed-table-wrap td { overflow-wrap: anywhere; }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -460,6 +466,33 @@ export function renderAppHtml() {
     .failed-panel[hidden] {
       display: none;
     }
+
+    .version-review {
+      display: grid;
+      gap: 12px;
+      border-top: 1px solid var(--line);
+      padding-top: 18px;
+      min-width: 0;
+    }
+
+    .version-review[hidden] { display: none; }
+    .version-review h3 { margin: 0; font-size: 17px; }
+    .version-review p { margin: 0; overflow-wrap: anywhere; }
+    .version-candidates { display: grid; gap: 0; min-width: 0; }
+    .version-candidate {
+      display: grid;
+      grid-template-columns: 20px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      border-bottom: 1px solid var(--line);
+      padding: 14px 0;
+      cursor: pointer;
+    }
+    .version-candidate input { margin: 4px 0 0; accent-color: var(--accent); }
+    .version-candidate-copy { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+    .version-candidate-title { font-size: 14px; font-weight: 760; }
+    .version-candidate a { color: var(--accent-strong); font-size: 13px; width: fit-content; }
+    .log-row span:first-child { min-width: 0; overflow-wrap: anywhere; }
 
     .badge {
       display: inline-flex;
@@ -851,6 +884,21 @@ export function renderAppHtml() {
               <div class="metric"><p class="metric-label">失败</p><p class="metric-value" id="importFailed">0</p></div>
             </div>
             <div class="log" id="importLog"></div>
+            <section class="version-review" id="versionReviewPanel" hidden aria-labelledby="versionReviewTitle">
+              <div class="status-line">
+                <h3 id="versionReviewTitle">确认其他版本</h3>
+                <span id="versionReviewPosition"></span>
+              </div>
+              <p id="versionReviewSource"></p>
+              <p class="field-hint" id="versionReviewMetadata"></p>
+              <p class="field-hint" id="versionReviewReason"></p>
+              <div class="version-candidates" id="versionReviewCandidates"></div>
+              <div class="toolbar">
+                <button class="button" id="confirmVersion" type="button" disabled>确认选中版本</button>
+                <button class="button secondary" id="skipVersion" type="button">跳过这首</button>
+                <button class="button secondary" id="skipAllVersions" type="button">跳过剩余</button>
+              </div>
+            </section>
             <section class="failed-panel" id="failedPanel" hidden>
               <div class="status-line">
                 <span>失败歌曲</span>
@@ -932,6 +980,9 @@ export function renderAppHtml() {
       failedTrackRows: new Map(),
       importControl: null,
       failedTracks: new Map(),
+      matchMeter: null,
+      catalogMetrics: null,
+      versionReview: null,
       rateLimitNoticeAt: 0,
       parseStartedAt: 0,
       parseProgress: 0,
@@ -996,6 +1047,15 @@ export function renderAppHtml() {
       failedPanel: document.getElementById("failedPanel"),
       failedListCount: document.getElementById("failedListCount"),
       failedTrackTable: document.getElementById("failedTrackTable"),
+      versionReviewPanel: document.getElementById("versionReviewPanel"),
+      versionReviewPosition: document.getElementById("versionReviewPosition"),
+      versionReviewSource: document.getElementById("versionReviewSource"),
+      versionReviewMetadata: document.getElementById("versionReviewMetadata"),
+      versionReviewReason: document.getElementById("versionReviewReason"),
+      versionReviewCandidates: document.getElementById("versionReviewCandidates"),
+      confirmVersion: document.getElementById("confirmVersion"),
+      skipVersion: document.getElementById("skipVersion"),
+      skipAllVersions: document.getElementById("skipAllVersions"),
       pauseImport: document.getElementById("pauseImport"),
       cancelImport: document.getElementById("cancelImport"),
       returnToParsed: document.getElementById("returnToParsed"),
@@ -1023,6 +1083,9 @@ export function renderAppHtml() {
     elements.cancelQueue.addEventListener("click", () => cancelQueue());
     elements.pauseImport.addEventListener("click", () => toggleImportPause());
     elements.cancelImport.addEventListener("click", () => cancelImport());
+    elements.confirmVersion.addEventListener("click", () => completeVersionChoice(false));
+    elements.skipVersion.addEventListener("click", () => completeVersionChoice(true));
+    elements.skipAllVersions.addEventListener("click", () => skipRemainingVersions());
     elements.returnToParsed.addEventListener("click", () => showView("parse"));
     elements.modalClose.addEventListener("click", () => elements.modal.classList.remove("active"));
     window.addEventListener("beforeunload", () => releaseQueue("page_unload", true));
@@ -1443,7 +1506,10 @@ export function renderAppHtml() {
 
     async function connectAppleMusic() {
       if (!state.parsed) return;
-      if (state.importControl && state.importControl.running) return;
+      if (state.importControl && state.importControl.running) {
+        showView("import");
+        return;
+      }
       const playlistNameResult = validatePlaylistNameInput(true);
       if (!playlistNameResult.ok) {
         return;
@@ -1483,6 +1549,7 @@ export function renderAppHtml() {
         state.musicUserToken = await authorizeAppleMusic(music);
 
         setImportProgress(8, "Apple Music 已授权");
+        elements.appStatus.textContent = "匹配中";
         addLog(elements.importLog, "授权完成，开始匹配歌曲");
         await importToAppleMusic(music, state.parsed, playlistNameResult.name);
       } catch (error) {
@@ -1608,6 +1675,33 @@ export function renderAppHtml() {
       elements.playlistNameHint.classList.toggle("error", isError);
     }
 
+    function createMatchMeter(now = Date.now) {
+      const startedAt = now();
+      let pausedAt = null;
+      let pausedMs = 0;
+      const samples = [{ time: 0, completed: 0 }];
+      return {
+        pause() { if (pausedAt === null) pausedAt = now(); },
+        resume() {
+          if (pausedAt !== null) pausedMs += now() - pausedAt;
+          pausedAt = null;
+        },
+        sample(completed) {
+          const current = pausedAt === null ? now() : pausedAt;
+          const activeMs = Math.max(0, current - startedAt - pausedMs);
+          samples.push({ time: activeMs, completed });
+          while (samples.length > 2 && samples[1].time <= activeMs - 30000) samples.shift();
+          while (samples.length > 512) samples.shift();
+          const anchor = samples[0];
+          return {
+            recentSpeed: (completed - anchor.completed) / Math.max(0.1, (activeMs - anchor.time) / 1000),
+            averageSpeed: completed / Math.max(0.1, activeMs / 1000),
+            sampleCount: samples.length
+          };
+        }
+      };
+    }
+
     async function importToAppleMusic(music, parsed, playlistName) {
       const tracks = parsed.tracks.filter((track) => !track.missing);
       const storefront = music.storefrontId || "cn";
@@ -1616,14 +1710,16 @@ export function renderAppHtml() {
       state.rateLimitNoticeAt = 0;
       setImportProgress(8, "稳态匹配歌曲 0/" + tracks.length);
 
-      const matchStartedAt = Date.now();
+      state.matchMeter = createMatchMeter();
+      state.catalogMetrics = { requests: 0, cacheHits: 0, localCacheHits: 0, totalRoundTripMs: 0, rateLimited: 0 };
+      if (state.importControl && state.importControl.paused) state.matchMeter.pause();
       const matchResult = await matchAppleSongs(music, storefront, tracks, (progress) => {
-        const elapsedSeconds = Math.max((Date.now() - matchStartedAt) / 1000, 0.1);
-        const speed = progress.completed / elapsedSeconds;
+        const speed = state.matchMeter.sample(progress.completed);
         const percent = 8 + Math.round((progress.completed / Math.max(tracks.length, 1)) * 62);
         setImportProgress(
           Math.min(percent, 70),
-          "匹配歌曲 " + progress.completed + "/" + tracks.length + " · " + speed.toFixed(1) + " 首/秒"
+          "匹配歌曲 " + progress.completed + "/" + tracks.length + " · 近30秒 " + speed.recentSpeed.toFixed(1) + " 首/秒 · 平均 " + speed.averageSpeed.toFixed(1) +
+            (progress.pending ? " · 待确认 " + progress.pending : "")
         );
         elements.importMatched.textContent = String(progress.matched);
         elements.importFailed.textContent = String(progress.failed);
@@ -1631,13 +1727,15 @@ export function renderAppHtml() {
         if (progress.completed % 25 === 0 || progress.completed === tracks.length) {
           addLog(
             elements.importLog,
-            "已匹配 " + progress.completed + "/" + tracks.length + "，成功 " + progress.matched + " 首，速度 " + speed.toFixed(1) + " 首/秒"
+            "已匹配 " + progress.completed + "/" + tracks.length + "，成功 " + progress.matched + "，待确认 " + progress.pending +
+              "，近30秒 " + speed.recentSpeed.toFixed(1) + " 首/秒；" + catalogMetricsText(progress.completed)
           );
         }
       });
 
       const rows = matchResult.rows;
-      const failed = matchResult.failed;
+      if (matchResult.pending) await reviewMatchedRows(rows, matchResult);
+      const failed = rows.filter((row) => !row.apple).length;
       const matchedRows = rows.filter((row) => row.apple);
       if (!matchedRows.length) {
         setImportProgress(100, "没有可载入曲目");
@@ -1686,6 +1784,7 @@ export function renderAppHtml() {
       let completed = 0;
       let matched = 0;
       let failed = 0;
+      let pending = 0;
 
       async function runWorker() {
         while (nextIndex < tracks.length) {
@@ -1710,9 +1809,7 @@ export function renderAppHtml() {
                 matchNotice = notice;
               });
               await waitForImportTurn();
-              if (!match && matchNotice && matchNotice.reason === "recording_unavailable") {
-                failureReason = "目标地区（" + storefront.toUpperCase() + "）未找到同一录音";
-              }
+              if (!match && matchNotice) failureReason = unmatchedReason(matchNotice.reason, storefront);
               break;
             } catch (error) {
               if (error && error.name === "ImportCanceledError") throw error;
@@ -1734,15 +1831,20 @@ export function renderAppHtml() {
             matched += 1;
             rows[trackIndex] = { source: track, apple: match, status: "matched" };
             setTrackStatus(track.id, "已匹配", "ok");
+          } else if (matchNotice && Array.isArray(matchNotice.candidates) && matchNotice.candidates.length) {
+            pending += 1;
+            rows[trackIndex] = { source: track, apple: null, status: "needs_review", reason: failureReason,
+              candidates: matchNotice.candidates.slice(0, 3) };
+            setTrackStatus(track.id, "待确认", "warn");
           } else {
             failed += 1;
             rows[trackIndex] = { source: track, apple: null, status: "not_found", reason: failureReason };
-            setTrackStatus(track.id, "未找到", "fail");
+            setTrackStatus(track.id, "未匹配", "fail");
             recordFailedTrack(track, failureReason);
           }
 
           completed += 1;
-          onProgress({ completed, matched, failed });
+          onProgress({ completed, matched, failed, pending });
         }
       }
 
@@ -1753,7 +1855,154 @@ export function renderAppHtml() {
       if (state.importControl && state.importControl.canceled) {
         throw createImportCanceledError();
       }
-      return { rows, matched, failed };
+      return { rows, matched, failed, pending };
+    }
+
+    function unmatchedReason(reason, storefront) {
+      const labels = {
+        no_results: "Apple Music 搜索未返回歌曲",
+        title_mismatch: "已搜到歌曲，但歌名无法可靠对应",
+        artist_mismatch: "已搜到同名歌曲，但歌手无法可靠对应",
+        duration_mismatch: "同名同歌手候选的时长差超过 15 秒",
+        version_mismatch: "已找到其他版本，需要确认",
+        low_confidence: "已找到候选，但匹配可信度不足",
+        unconfirmed: "已找到候选，但无法可靠确认"
+      };
+      return reason === "recording_unavailable" ? "目标地区（" + storefront.toUpperCase() + "）未找到同一录音"
+        : labels[reason] || "Apple Music 未找到匹配";
+    }
+
+    async function reviewMatchedRows(rows, summary) {
+      await waitForImportTurn();
+      const pending = rows.filter((row) => row.status === "needs_review");
+      if (!pending.length) return;
+      return new Promise((resolve, reject) => {
+        state.versionReview = { rows: pending, cursor: 0, selectedIndex: -1, summary, resolve, reject };
+        if (state.importControl) state.importControl.reviewing = true;
+        renderVersionReview();
+        updateImportControlButtons();
+      });
+    }
+
+    function formatTrackDuration(milliseconds) {
+      if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "-";
+      const seconds = Math.floor(milliseconds / 1000);
+      return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
+    }
+
+    function renderVersionReview() {
+      const review = state.versionReview;
+      if (!review) return;
+      const row = review.rows[review.cursor];
+      const source = row.source;
+      const remaining = review.rows.length - review.cursor;
+      review.selectedIndex = -1;
+      elements.versionReviewPanel.hidden = false;
+      elements.appStatus.textContent = "等待确认";
+      elements.versionReviewPosition.textContent = (review.cursor + 1) + "/" + review.rows.length;
+      elements.versionReviewSource.textContent = "源歌曲：" + source.name;
+      elements.versionReviewMetadata.textContent = (source.artists || []).join(" / ") + " · " +
+        (source.album || "专辑未知") + " · " + formatTrackDuration(source.durationMs);
+      elements.versionReviewReason.textContent = row.reason;
+      elements.confirmVersion.disabled = true;
+      elements.skipAllVersions.textContent = "跳过剩余 " + remaining + " 首";
+      elements.versionReviewCandidates.replaceChildren(...row.candidates.map((candidate, index) => {
+        const attributes = candidate.attributes || {};
+        const label = document.createElement("label");
+        label.className = "version-candidate";
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = "versionCandidate";
+        input.value = String(index);
+        input.addEventListener("change", () => selectVersionCandidate(index));
+        const copy = document.createElement("span");
+        copy.className = "version-candidate-copy";
+        const name = document.createElement("span");
+        name.className = "version-candidate-title";
+        name.textContent = attributes.name || "歌名未知";
+        const metadata = document.createElement("span");
+        metadata.className = "field-hint";
+        metadata.textContent = (attributes.artistName || "歌手未知") + " · " + (attributes.albumName || "专辑未知") +
+          " · " + formatTrackDuration(attributes.durationInMillis);
+        const reason = document.createElement("span");
+        reason.className = "field-hint";
+        const difference = source.durationMs && attributes.durationInMillis
+          ? Math.abs(source.durationMs - attributes.durationInMillis) / 1000 : null;
+        reason.textContent = unmatchedReason(candidate.confirmationReason, "cn") +
+          (difference !== null ? " · 时长差 " + difference.toFixed(1) + " 秒" : "");
+        copy.append(name, metadata, reason);
+        try {
+          const url = new URL(attributes.url);
+          if (url.protocol === "https:" && url.hostname === "music.apple.com") {
+            const link = document.createElement("a");
+            link.href = url.href;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "在 Apple Music 查看";
+            copy.appendChild(link);
+          }
+        } catch {}
+        label.append(input, copy);
+        return label;
+      }));
+      setImportProgress(70, "待确认其他版本 " + remaining + " 首");
+    }
+
+    function selectVersionCandidate(index) {
+      const review = state.versionReview;
+      if (!review || !Number.isInteger(index) || index < 0 || index >= review.rows[review.cursor].candidates.length) return;
+      review.selectedIndex = index;
+      elements.confirmVersion.disabled = false;
+    }
+
+    function completeVersionChoice(skip, renderNext = true) {
+      const review = state.versionReview;
+      if (!review || (state.importControl && state.importControl.canceled)) return;
+      const row = review.rows[review.cursor];
+      if (!skip) {
+        const selected = row.candidates[review.selectedIndex];
+        if (!selected || typeof selected.id !== "string" || !selected.id || selected.type !== "songs") return;
+        row.apple = selected;
+        row.confirmed = true;
+        row.status = "matched";
+        review.summary.matched += 1;
+        setTrackStatus(row.source.id, "已确认", "ok");
+      } else {
+        row.status = "not_found";
+        row.reason = "已跳过其他版本：" + row.reason;
+        review.summary.failed += 1;
+        recordFailedTrack(row.source, row.reason);
+        setTrackStatus(row.source.id, "已跳过", "fail");
+      }
+      review.summary.pending -= 1;
+      elements.importMatched.textContent = String(review.summary.matched);
+      elements.importFailed.textContent = String(review.summary.failed);
+      review.cursor += 1;
+      if (review.cursor < review.rows.length) {
+        if (renderNext) renderVersionReview();
+      } else {
+        state.versionReview = null;
+        elements.versionReviewPanel.hidden = true;
+        if (state.importControl) state.importControl.reviewing = false;
+        updateImportControlButtons();
+        review.resolve();
+      }
+    }
+
+    function skipRemainingVersions() {
+      while (state.versionReview) {
+        if (state.importControl && state.importControl.canceled) { cancelVersionReview(); return; }
+        completeVersionChoice(true, false);
+      }
+    }
+
+    function cancelVersionReview() {
+      const review = state.versionReview;
+      if (!review) return;
+      state.versionReview = null;
+      elements.versionReviewPanel.hidden = true;
+      if (state.importControl) state.importControl.reviewing = false;
+      review.reject(createImportCanceledError());
     }
 
     async function findAppleSong(music, storefront, track, searchCache, searchLimiter, onUnmatched) {
@@ -1774,10 +2023,15 @@ export function renderAppHtml() {
       if (!searchCache.has(cacheKey)) {
         if (searchCache.size >= 1000) searchCache.delete(searchCache.keys().next().value);
         const searchPromise = requestAppleCatalog(payload, searchLimiter).catch((error) => {
-          searchCache.delete(cacheKey);
+          if (searchCache.get(cacheKey) === searchPromise) searchCache.delete(cacheKey);
           throw error;
         });
         searchCache.set(cacheKey, searchPromise);
+      } else {
+        const existing = searchCache.get(cacheKey);
+        searchCache.delete(cacheKey);
+        searchCache.set(cacheKey, existing);
+        if (state.catalogMetrics) state.catalogMetrics.localCacheHits += 1;
       }
 
       return searchCache.get(cacheKey);
@@ -1785,6 +2039,8 @@ export function renderAppHtml() {
 
     async function requestAppleCatalog(payload, searchLimiter) {
       return runAppleSearchWithRetry("Apple catalog search", searchLimiter, async () => {
+        const startedAt = Date.now();
+        if (state.catalogMetrics) state.catalogMetrics.requests += 1;
         let response;
         let result;
         try {
@@ -1796,11 +2052,14 @@ export function renderAppHtml() {
           });
           result = await response.json();
         } catch {
+          recordCatalogDiagnostics(null, startedAt);
           const error = new Error("Apple catalog connection unavailable");
           error.status = 503;
           throw error;
         }
+        recordCatalogDiagnostics(result, startedAt);
         if (!response.ok) {
+          if (state.catalogMetrics && response.status === 429) state.catalogMetrics.rateLimited += 1;
           const error = createAppleHttpError("Apple catalog search failed", response);
           error.code = result.error && result.error.code;
           if (result.error && result.error.details && Number.isFinite(result.error.details.retryAfterMs)) {
@@ -1812,10 +2071,38 @@ export function renderAppHtml() {
       });
     }
 
+    function recordCatalogDiagnostics(result, startedAt) {
+      const metrics = state.catalogMetrics;
+      if (!metrics) return;
+      metrics.totalRoundTripMs += Math.max(0, Date.now() - startedAt);
+      if (result && result.cacheHit === true) metrics.cacheHits += 1;
+      if (result && result.diagnostics) {
+        metrics.latest = {};
+        for (const field of ["elapsedMs", "intervalMs", "queueDepth", "activeRequests", "cooldownMs", "rateLimitEvents"]) {
+          const value = result.diagnostics[field];
+          if (Number.isFinite(value) && value >= 0) metrics.latest[field] = value;
+        }
+      }
+    }
+
+    function catalogMetricsText(completed) {
+      const metrics = state.catalogMetrics;
+      const average = metrics.requests / Math.max(completed, 1);
+      const cachePercent = metrics.requests ? Math.round(metrics.cacheHits / metrics.requests * 100) : 0;
+      let text = "查询 " + average.toFixed(1) + " 次/首，服务端缓存 " + cachePercent + "%";
+      if (metrics.latest) {
+        text += "，上游间隔 " + (metrics.latest.intervalMs || 0) + "ms，排队 " + (metrics.latest.queueDepth || 0);
+        if (metrics.latest.rateLimitEvents) text += "，共享限流 " + metrics.latest.rateLimitEvents + " 次";
+      }
+      if (metrics.rateLimited) text += "，本次限流响应 " + metrics.rateLimited + " 次";
+      return text;
+    }
+
     function pauseForAppleSearch() {
       const control = state.importControl;
       if (!control || control.canceled || control.paused) return;
       control.paused = true;
+      if (state.matchMeter) state.matchMeter.pause();
       updateImportControlButtons();
       setImportProgress(Number.parseInt(elements.importPercent.textContent, 10) || 0, "搜索暂时不可用，已暂停");
       addLog(elements.importLog, "搜索重试后仍不可用，已暂停；当前歌曲尚未计入失败");
@@ -2021,6 +2308,8 @@ export function renderAppHtml() {
       elements.failedTrackTable.innerHTML = "";
       elements.failedListCount.textContent = "0";
       elements.failedPanel.hidden = true;
+      elements.versionReviewPanel.hidden = true;
+      elements.versionReviewCandidates.replaceChildren();
       elements.importTotal.textContent = "0";
       elements.importMatched.textContent = "0";
       elements.importSucceeded.textContent = "0";
@@ -2053,10 +2342,12 @@ export function renderAppHtml() {
     }
 
     function finishImportControl() {
+      cancelVersionReview();
       if (state.importControl) {
         state.importControl.running = false;
         state.importControl.paused = false;
       }
+      state.matchMeter = null;
       updateImportControlButtons();
     }
 
@@ -2064,6 +2355,10 @@ export function renderAppHtml() {
       const control = state.importControl;
       if (!control || !control.running || control.canceled) return;
       control.paused = !control.paused;
+      if (state.matchMeter) {
+        if (control.paused) state.matchMeter.pause();
+        else state.matchMeter.resume();
+      }
       updateImportControlButtons();
       addLog(elements.importLog, control.paused ? "导入已暂停，当前请求完成后停止推进" : "导入已继续");
       if (control.paused) {
@@ -2076,6 +2371,7 @@ export function renderAppHtml() {
       if (!control || !control.running) return;
       control.canceled = true;
       control.paused = false;
+      cancelVersionReview();
       updateImportControlButtons();
       addLog(elements.importLog, "正在停止导入，当前请求完成后退出");
     }
@@ -2083,9 +2379,10 @@ export function renderAppHtml() {
     function updateImportControlButtons() {
       const control = state.importControl;
       const running = Boolean(control && control.running && !control.canceled);
-      elements.pauseImport.disabled = !running;
+      elements.pauseImport.disabled = !running || Boolean(control && control.reviewing);
       elements.cancelImport.disabled = !running;
       elements.pauseImport.textContent = control && control.paused ? "继续" : "暂停";
+      elements.connectApple.textContent = running ? "返回导入进度" : "连接 Apple Music";
     }
 
     async function waitForImportTurn() {
@@ -2153,7 +2450,15 @@ export function renderAppHtml() {
       const elapsed = state.parseStartedAt ? Math.round((Date.now() - state.parseStartedAt) / 1000) + "s" : "";
       row.innerHTML = "<span>" + escapeHtml(text) + "</span><span>" + elapsed + "</span>";
       container.appendChild(row);
-      container.scrollTop = container.scrollHeight;
+      while (container.children.length > 100) container.firstElementChild.remove();
+      if (!state.logScrollScheduled) state.logScrollScheduled = new WeakSet();
+      if (!state.logScrollScheduled.has(container)) {
+        state.logScrollScheduled.add(container);
+        requestAnimationFrame(() => {
+          state.logScrollScheduled.delete(container);
+          container.scrollTop = container.scrollHeight;
+        });
+      }
     }
 
     function downloadParsedJson() {

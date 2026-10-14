@@ -42,6 +42,39 @@ export function createSongMatcher() {
     return best;
   }
 
+  function artistSimilarity(sourceArtists, targetArtist) {
+    const identity = value => normalizeText(value).replace(/ /g, "");
+    const sourceNames = sourceArtists.map(identity);
+    const whole = identity(targetArtist);
+    if (!whole) return 0;
+    if (sourceNames.includes(whole)) return 1;
+    const credits = String(targetArtist || "").normalize("NFKC").split(/\b(?:feat(?:uring)?|ft)\.?\s+/iu);
+    for (const credit of credits) {
+      if (sourceNames.includes(identity(credit))) return 1;
+      const separator = /\p{Script=Han}/u.test(credit) ? /\s*(?:[&、,;/]|\s+x\s+)\s*/iu
+        : /\s*(?:[&、,;]|\s+x\s+|\s+\/\s+)\s*/iu;
+      const members = credit.split(separator).map(normalizeText).filter(Boolean);
+      if (members.some(member => sourceNames.includes(identity(member)))) return 1;
+      for (let startIndex = 0; startIndex < members.length - 1; startIndex += 1) {
+        let creditedName = members[startIndex];
+        for (const member of members.slice(startIndex + 1)) {
+          creditedName += " " + member;
+          if (sourceArtists.includes(creditedName)) return 1;
+        }
+      }
+    }
+    return 0;
+  }
+
+  function partialArtistName(sourceArtists, targetArtist) {
+    const target = normalizeText(targetArtist).replace(/ /g, "");
+    if (!target) return false;
+    return sourceArtists.some(artist => {
+      const source = artist.replace(/ /g, "");
+      return source && source !== target && (source.includes(target) || target.includes(source));
+    });
+  }
+
   function versions(value) {
     const text = String(value || "").normalize("NFKC");
     const markers = {
@@ -49,6 +82,7 @@ export function createSongMatcher() {
       karaoke: /\bkaraoke\b|カラオケ|卡拉|노래방|카라오케|караоке/iu,
       live: /\blive\b|现场|現場|ライブ|라이브|концерт/iu,
       remix: /\b(remix|mix version)\b|混音|リミックス|리믹스|ремикс/iu,
+      dj: /[([]\s*dj\b[^)\]]*[)\]]|[-–—]\s*dj\b[^()[\]]*$|\bdj[\p{Letter}\p{Number}\s._-]*(?:版|ver(?:sion)?\.?|(?:re)?mix)\s*[)\]]?\s*$/iu,
       acoustic: /\bacoustic\b|unplugged|弾き語り|アコースティック|어쿠스틱|акустич/iu,
       piano: /\bpiano\b|钢琴|鋼琴|ピアノ|피아노|фортепиано/iu,
       sped: /\b(sped[ -]?up|speed[ -]?up|nightcore)\b|加速|倍速/iu,
@@ -63,9 +97,9 @@ export function createSongMatcher() {
 
   function compatibleVersion(track, candidate) {
     const source = recordingVersions(track.name, track.album);
-    const target = recordingVersions(candidate.attributes?.name, candidate.attributes?.albumName);
+    const target = recordingVersions(candidate?.attributes?.name, candidate?.attributes?.albumName);
     const sourceLabels = namedVersions(track.name);
-    const targetLabels = namedVersions(candidate.attributes?.name);
+    const targetLabels = namedVersions(candidate?.attributes?.name);
     return source.length === target.length && source.every(version => target.includes(version)) &&
       sourceLabels.length === targetLabels.length && sourceLabels.every(label => targetLabels.includes(label));
   }
@@ -86,7 +120,7 @@ export function createSongMatcher() {
     if (suffix) segments.push(suffix[1]);
     return strings(segments.filter(segment => /ver(?:sion)?\.?\s*$/iu.test(segment))
       .map(segment => normalizeText(segment.replace(/ver(?:sion)?\.?\s*$/iu, "")))
-      .filter(label => label && !/^(original|studio|album)$/.test(label) && !versions(label).length && !wantsEdited(label)));
+      .filter(label => label && !/^(original|studio|album|dj)$/.test(label) && !versions(label).length && !wantsEdited(label)));
   }
 
   function ratingBonus(track, candidate) {
@@ -98,21 +132,48 @@ export function createSongMatcher() {
     return bonus;
   }
 
-  function scoreCandidate(track, candidate) {
+  function inspectCandidate(track, candidate) {
     const attributes = candidate?.attributes || {};
-    if (!compatibleVersion(track, candidate)) return 0;
     const sourceTitles = searchTitles(track).flatMap(titleForms);
     const title = bestSimilarity(sourceTitles, titleForms(attributes.name));
     const sourceArtists = strings([track.artists || [], track.artistAliases || []]).map(normalizeText);
-    const artist = bestSimilarity(sourceArtists, [normalizeText(attributes.artistName)]);
+    const artist = artistSimilarity(sourceArtists, attributes.artistName);
     const sourceAlbums = strings([track.album, track.albumAliases || []]).map(normalizeText);
-    const album = bestSimilarity(sourceAlbums, [normalizeText(attributes.albumName)]);
+    const targetAlbum = normalizeText(attributes.albumName);
+    const album = bestSimilarity(sourceAlbums, [targetAlbum]);
     const durationDifference = track.durationMs && attributes.durationInMillis
       ? Math.abs(track.durationMs - attributes.durationInMillis) : Infinity;
     const duration = durationDifference <= 2500 ? 0.16 : durationDifference <= 7000 ? 0.1 : 0;
-    if (title < 0.65 || (Number.isFinite(durationDifference) && durationDifference > 15000)) return 0;
-    if (artist < 0.65 && !(title >= 0.9 && album === 1 && durationDifference <= 2500)) return 0;
-    return title * 0.5 + artist * 0.26 + duration + album * 0.08 + ratingBonus(track, candidate);
+    const independentAlbum = sourceAlbums.some(sourceAlbum => {
+      const identity = sourceAlbum.replace(/\s+(single|ep)$/u, "").replace(/ /g, "");
+      return similarity(sourceAlbum, targetAlbum) === 1 &&
+        !sourceTitles.some(sourceTitle => sourceTitle.replace(/ /g, "") === identity) &&
+        !sourceArtists.some(sourceArtist => sourceArtist.replace(/ /g, "") === identity);
+    });
+    const albumDurationIdentity = title >= 0.9 && album === 1 && durationDifference <= 2500 &&
+      independentAlbum && !partialArtistName(sourceArtists, attributes.artistName);
+    let reason = title < 0.65 ? "title_mismatch" : artist < 0.65 && !albumDurationIdentity ? "artist_mismatch"
+      : !compatibleVersion(track, candidate) ? "version_mismatch"
+        : Number.isFinite(durationDifference) && durationDifference > 15000 ? "duration_mismatch" : null;
+    const score = reason ? 0 : title * 0.5 + artist * 0.26 + duration + album * 0.08 + ratingBonus(track, candidate);
+    if (!reason && score < acceptScore) reason = "low_confidence";
+    return { score, reason, titleSimilarity: title, artistSimilarity: artist, durationDifferenceMs: durationDifference };
+  }
+
+  function scoreCandidate(track, candidate) {
+    return inspectCandidate(track, candidate).score;
+  }
+
+  function needsConfirmation(inspection) {
+    return inspection.titleSimilarity === 1 && inspection.artistSimilarity === 1 &&
+      (inspection.reason === "version_mismatch" || inspection.reason === "duration_mismatch");
+  }
+
+  function compareEvidence(left, right) {
+    const confidence = inspection => inspection.titleSimilarity * 0.5 + inspection.artistSimilarity * 0.26;
+    return confidence(right.inspection) - confidence(left.inspection) ||
+      left.inspection.durationDifferenceMs - right.inspection.durationDifferenceMs ||
+      right.inspection.score - left.inspection.score;
   }
 
   function rankedCandidates(track, candidates) {
@@ -165,8 +226,23 @@ export function createSongMatcher() {
     const storefront = options.storefront || "cn";
     const queries = buildSearchQueries(track);
     const resolvedIsrcs = new Set();
+    const targetEvidence = new Map();
+    let sawTargetResults = false;
     let identifiedUnavailable = false;
-    if (!track.name || !queries.length) return null;
+    function collectTargetCandidates(candidates) {
+      if (candidates.length) sawTargetResults = true;
+      for (const candidate of candidates) {
+        if (!candidate?.id || !candidate.attributes) continue;
+        const evidence = { candidate, inspection: inspectCandidate(track, candidate) };
+        const key = String(candidate.id);
+        const previous = targetEvidence.get(key);
+        if (!previous || compareEvidence(evidence, previous) < 0) targetEvidence.set(key, evidence);
+      }
+    }
+    if (!track.name || !queries.length) {
+      if (options.onUnmatched) options.onUnmatched({ reason: "unconfirmed", storefront, candidates: [] });
+      return null;
+    }
     if (track.isrc && options.resolveIsrc) {
       const direct = verifiedMatch(track, await options.resolveIsrc(storefront, [track.isrc]), [track.isrc]);
       if (direct) return direct;
@@ -174,9 +250,11 @@ export function createSongMatcher() {
     }
     let best = null;
     const targetCandidates = await options.search(storefront, queries[0]);
+    collectTargetCandidates(targetCandidates);
     best = scoreCandidates(track, targetCandidates);
     if (best && best.score >= strongScore) return best;
-    if (options.resolveIsrc) {
+    const hasTargetAlternatives = Array.from(targetEvidence.values()).some(evidence => needsConfirmation(evidence.inspection));
+    if (options.resolveIsrc && !hasTargetAlternatives) {
       for (const native of nativeStorefronts(track).filter(region => region !== storefront)) {
         for (const query of queries.slice(0, 2)) {
           let candidates;
@@ -206,15 +284,22 @@ export function createSongMatcher() {
       }
     }
     for (const query of queries.slice(1, best ? 2 : queries.length)) {
-      const result = scoreCandidates(track, await options.search(storefront, query));
+      const candidates = await options.search(storefront, query);
+      collectTargetCandidates(candidates);
+      const result = scoreCandidates(track, candidates);
       if (result && (!best || result.score > best.score)) best = result;
       if (best && best.score >= strongScore) return best;
     }
     if (!best && options.onUnmatched) {
-      options.onUnmatched({ reason: identifiedUnavailable ? "recording_unavailable" : "unconfirmed", storefront });
+      const evidence = Array.from(targetEvidence.values()).sort(compareEvidence);
+      const alternatives = evidence.filter(entry => needsConfirmation(entry.inspection)).slice(0, 3);
+      const reason = alternatives[0]?.inspection.reason || evidence[0]?.inspection.reason ||
+        (identifiedUnavailable ? "recording_unavailable" : sawTargetResults ? "unconfirmed" : "no_results");
+      const candidates = alternatives.map(entry => ({ ...entry.candidate, confirmationReason: entry.inspection.reason }));
+      options.onUnmatched({ reason, storefront, candidates });
     }
     return best;
   }
 
-  return { normalizeText, buildSearchQueries, nativeStorefronts, scoreCandidate, scoreCandidates, match };
+  return { normalizeText, buildSearchQueries, nativeStorefronts, inspectCandidate, scoreCandidate, scoreCandidates, match };
 }

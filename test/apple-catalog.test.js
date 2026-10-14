@@ -160,7 +160,7 @@ test("Apple catalog coordination", async (suite) => {
   await suite.test("strips arbitrary URLs and user credentials from normalized requests", () => {
     assert.deepEqual(normalizeCatalogRequest(search("Song", {
       url: "https://example.com/private", musicUserToken: "personal-secret", userToken: "personal-secret",
-      headers: { Authorization: "personal-secret" }
+      headers: { Authorization: "personal-secret" }, diagnostics: { token: "personal-secret" }, clientId: "personal-secret"
     })), { action: "search", storefront: "cn", term: "Song", limit: 25 });
   });
 
@@ -387,6 +387,80 @@ test("Apple catalog coordination", async (suite) => {
     assert.equal((await catalogService.request({ action: "isrc", isrcs: ["USAAA2400001", "USAAA2400002"] })).cacheHit, true);
   });
 
+  await suite.test("diagnostics are opt-in numeric aggregates and preserve the default result shape", async () => {
+    const time = clock(0, true);
+    const catalogService = service(async () => {
+      await time.sleep(125);
+      return response();
+    }, time, { MUSIC_USER_TOKEN: "personal-secret" });
+    const payload = search("private-query", {
+      clientId: "private-client", diagnostics: { token: "personal-secret" }
+    });
+    const result = await catalogService.request(payload, { diagnostics: true, token: "personal-secret" });
+    assert.deepEqual(result, {
+      data: [song], cacheHit: false,
+      diagnostics: { elapsedMs: 125, intervalMs: 250, queueDepth: 0, activeRequests: 0, cooldownMs: 0, rateLimitEvents: 0 }
+    });
+    assert.doesNotMatch(JSON.stringify(result.diagnostics), /private|secret|query|token|client/);
+    assert.deepEqual(await catalogService.request(payload), { data: [song], cacheHit: true });
+    assert.deepEqual(await catalogService.request(payload, { diagnostics: false }), { data: [song], cacheHit: true });
+    assert.deepEqual(await catalogService.request(payload, { diagnostics: "true" }), { data: [song], cacheHit: true });
+    assert.deepEqual((await catalogService.request(payload, { diagnostics: true })).diagnostics, {
+      elapsedMs: 0, intervalMs: 250, queueDepth: 0, activeRequests: 0, cooldownMs: 0, rateLimitEvents: 0
+    });
+  });
+
+  await suite.test("deduplicated callers independently opt into diagnostics with their own elapsed time", async () => {
+    const time = clock();
+    const gate = deferred();
+    let calls = 0;
+    const catalogService = service(async () => { calls += 1; return gate.promise; }, time);
+    const first = catalogService.request(search(), { diagnostics: true });
+    await flush();
+    await time.advance(100);
+    const second = catalogService.request(search(), { diagnostics: true });
+    const plain = catalogService.request(search());
+    await time.advance(200);
+    gate.resolve(response());
+    const results = await Promise.all([first, second, plain]);
+    assert.equal(calls, 1);
+    assert.equal(results[0].diagnostics?.elapsedMs, 300);
+    assert.equal(results[1].diagnostics?.elapsedMs, 200);
+    assert.deepEqual(results[2], { data: [song], cacheHit: false });
+    assert.equal(results[0].cacheHit, false);
+    assert.equal(results[1].cacheHit, false);
+  });
+
+  await suite.test("cached diagnostics report shared queue contention and the full remaining cooldown", async () => {
+    const time = clock();
+    const gate = deferred();
+    const catalogService = service(async (input) => {
+      const term = new URL(input).searchParams.get("term");
+      if (term === "blocked") return gate.promise;
+      return term === "limited" ? response([], 429, { "Retry-After": "60" }) : response();
+    }, time);
+    await catalogService.request(search("cached"));
+    const blocked = catalogService.request(search("blocked"));
+    const limited = assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+    await time.advance(250);
+    await time.advance(250);
+    await limited;
+    const waiting = catalogService.request(search("waiting"));
+    try {
+      await flush();
+      const result = await catalogService.request(search("cached"), { diagnostics: true });
+      assert.deepEqual(result.diagnostics, {
+        elapsedMs: 0, intervalMs: 500, queueDepth: 1, activeRequests: 1, cooldownMs: 60000, rateLimitEvents: 1
+      });
+      await time.advance(1000);
+      assert.equal((await catalogService.request(search("cached"), { diagnostics: true })).diagnostics.cooldownMs, 59000);
+    } finally {
+      gate.resolve(response());
+      await time.advance(60000);
+      await Promise.all([blocked, waiting]);
+    }
+  });
+
   await suite.test("does not conflate case, punctuation, spacing, limits or regions in the cache", async () => {
     let calls = 0;
     const catalogService = service(async () => { calls += 1; return response(); });
@@ -518,6 +592,58 @@ test("Apple catalog coordination", async (suite) => {
     context.diagnostic(`16 search jobs, 1000ms latency, 250ms interval: concurrency 2 = ${previous.elapsed}ms; default 4 = ${optimized.elapsed}ms`);
   });
 
+  await suite.test("1000 uniform unique cold searches do not slow after 400 and keep cache and pending storage bounded", async (context) => {
+    const time = clock();
+    const starts = [];
+    const results = [];
+    let active = 0;
+    let maximumActive = 0;
+    let maximumPending = 0;
+    let issued = 0;
+    let completed = 0;
+    const catalogService = service(async () => {
+      starts.push(time.now());
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await time.sleep(1000);
+      active -= 1;
+      return response();
+    }, time);
+    const workers = Array.from({ length: 40 }, async () => {
+      while (issued < 1000) {
+        const index = issued++;
+        const pending = catalogService.request(search(`uniform ${index}`), { diagnostics: true });
+        maximumPending = Math.max(maximumPending, catalogService.inFlight.size);
+        results[index] = await pending;
+        completed += 1;
+      }
+    });
+    const outcomes = Promise.allSettled(workers);
+    await flush();
+    for (let step = 0; completed < 1000 && step < 1100; step += 1) {
+      await time.advance(250);
+      assert.ok(catalogService.cache.size <= 500);
+      assert.ok(catalogService.inFlight.size <= 40);
+    }
+    for (const outcome of await outcomes) {
+      if (outcome.status === "rejected") throw outcome.reason;
+    }
+    assert.equal(completed, 1000);
+    assert.equal(starts.length, 1000);
+    assert.ok(starts.slice(1).every((start, index) => start - starts[index] === 250));
+    assert.equal(starts[399] - starts[0], 99750);
+    assert.equal(starts[999] - starts[600], 99750);
+    assert.ok(results.every((result) => result.cacheHit === false));
+    assert.ok(results.slice(400).every((result) => result.diagnostics?.elapsedMs === 10000));
+    assert.equal(maximumActive, 4);
+    assert.equal(maximumPending, 40);
+    assert.equal(catalogService.cache.size, 500);
+    assert.equal(catalogService.inFlight.size, 0);
+    assert.equal(catalogService.queue.length, 0);
+    assert.equal(time.now(), 250750);
+    context.diagnostic("1000 cold searches, uniform 1000ms latency: early/late starts = 250ms; late queued elapsed = 10000ms; active <= 4, pending <= 40, cache <= 500");
+  });
+
   await suite.test("uses the default interval and clamps configured intervals", async () => {
     for (const [configured, interval] of [[undefined, 250], ["1", 100], ["10000", 5000], ["200", 200], ["junk", 250], ["250junk", 250]]) {
       const time = clock();
@@ -633,7 +759,7 @@ test("Apple catalog coordination", async (suite) => {
     assert.deepEqual(starts, [0, 250, 60300]);
   });
 
-  await suite.test("429 intervals grow to a cap and successes gradually recover without exceeding base speed", async () => {
+  await suite.test("429 intervals grow to a cap and four-success recovery never exceeds base speed", async () => {
     const time = clock(0, true);
     const starts = [];
     const catalogService = service(async () => {
@@ -650,7 +776,8 @@ test("Apple catalog coordination", async (suite) => {
     assert.ok(gaps[0] > 250);
     assert.ok(Math.max(...gaps) <= 3000);
     assert.ok(gaps.every((gap) => gap >= 250));
-    assert.ok(gaps[6] < gaps[5]);
+    assert.equal(gaps[6], gaps[5]);
+    assert.ok(gaps[8] < gaps[7]);
     assert.equal(gaps.at(-1), 250);
     const slowTime = clock(0, true);
     const slowStarts = [];
@@ -658,6 +785,232 @@ test("Apple catalog coordination", async (suite) => {
     await assert.rejects(slowService.request(search("one")), appleError(429, "apple_rate_limited"));
     await assert.rejects(slowService.request(search("two")), appleError(429, "apple_rate_limited"));
     assert.deepEqual(slowStarts, [0, 5000]);
+  });
+
+  await suite.test("recovery waits for four consecutive successes started after the full 429 cooldown", async () => {
+    const time = clock(0, true);
+    const starts = [];
+    const catalogService = service(async () => {
+      starts.push(time.now());
+      return starts.length === 1 ? response([], 429, { "Retry-After": "30" }) : response();
+    }, time);
+    await assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+    for (const [index, interval] of [500, 500, 500, 400, 400, 400, 400, 320].entries()) {
+      await catalogService.request(search(`post-cooldown ${index}`));
+      assert.equal(catalogService.interval, interval);
+      assert.equal(catalogService.cooldownUntil, 30000);
+    }
+    assert.deepEqual(starts, [0, 30000, 30500, 31000, 31500, 31900, 32300, 32700, 33100]);
+  });
+
+  await suite.test("pre-429 in-flight successes cannot shrink backoff or shorten the current cooldown", async () => {
+    const time = clock();
+    const gates = Array.from({ length: 4 }, deferred);
+    const starts = [];
+    const catalogService = service(async () => {
+      const index = starts.length;
+      starts.push(time.now());
+      return index < 4 ? gates[index].promise : response();
+    }, time);
+    const old = Array.from({ length: 3 }, (_, index) => catalogService.request(search(`old ${index}`)));
+    const limited = assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+    await flush();
+    for (let step = 0; step < 3; step += 1) await time.advance(250);
+    gates[3].resolve(response([], 429, { "Retry-After": "30" }));
+    await limited;
+    const fresh = Array.from({ length: 4 }, (_, index) => catalogService.request(search(`fresh ${index}`)));
+    try {
+      for (const gate of gates.slice(0, 3)) {
+        gate.resolve(response());
+        await flush();
+        assert.equal(catalogService.interval, 500);
+        assert.equal(catalogService.cooldownUntil, 30750);
+      }
+      await time.advance(29999);
+      assert.deepEqual(starts, [0, 250, 500, 750]);
+      await time.advance(1);
+      assert.equal(catalogService.interval, 500);
+      for (let step = 0; step < 2; step += 1) await time.advance(500);
+      assert.equal(catalogService.interval, 500);
+      await time.advance(500);
+      assert.equal(catalogService.interval, 400);
+      assert.deepEqual(starts.slice(4), [30750, 31250, 31750, 32250]);
+    } finally {
+      for (const gate of gates) gate.resolve(response());
+      for (let step = 0; step < 5; step += 1) await time.advance(30000);
+      await Promise.all([...old, ...fresh]);
+    }
+  });
+
+  await suite.test("the latest 429 epoch excludes an in-flight success even at the same zero-cooldown timestamp", async () => {
+    const time = clock();
+    const gates = [deferred(), deferred()];
+    let calls = 0;
+    const catalogService = service(async () => {
+      const index = calls++;
+      return index < 2 ? gates[index].promise : response();
+    }, time);
+    const limited = assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+    const old = catalogService.request(search("old"));
+    await flush();
+    await time.advance(250);
+    gates[0].resolve(response([], 429, { "Retry-After": "0" }));
+    await limited;
+    gates[1].resolve(response());
+    await old;
+    const intervals = [catalogService.interval];
+    for (let index = 0; index < 4; index += 1) {
+      const fresh = catalogService.request(search(`fresh ${index}`));
+      await time.advance(500);
+      await fresh;
+      intervals.push(catalogService.interval);
+    }
+    assert.deepEqual(intervals, [500, 500, 500, 500, 400]);
+  });
+
+  await suite.test("a stale pre-429 503 cannot reset recovery after three current-epoch successes", async () => {
+    const time = clock();
+    const gate = deferred();
+    const catalogService = service(async (input) => {
+      const term = new URL(input).searchParams.get("term");
+      if (term === "stale") return gate.promise;
+      return term === "limited" ? response([], 429, { "Retry-After": "1" }) : response();
+    }, time);
+    const staleFailure = assert.rejects(catalogService.request(search("stale")), appleError(503, "apple_search_unavailable"));
+    try {
+      await flush();
+      const limited = assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+      await time.advance(250);
+      await limited;
+      for (let index = 0; index < 3; index += 1) {
+        const healthy = catalogService.request(search(`healthy ${index}`));
+        await time.advance(index === 0 ? 1000 : 500);
+        await healthy;
+      }
+      assert.equal(catalogService.interval, 500);
+      gate.resolve(new Response(null, { status: 503 }));
+      await staleFailure;
+      const fourth = catalogService.request(search("fourth healthy"), { diagnostics: true });
+      await time.advance(500);
+      const result = await fourth;
+      assert.equal(result.diagnostics.intervalMs, 400);
+      assert.equal(result.diagnostics.cooldownMs, 0);
+      assert.equal(result.diagnostics.rateLimitEvents, 1);
+      assert.equal(catalogService.cooldownUntil, 1250);
+    } finally {
+      gate.resolve(new Response(null, { status: 503 }));
+      await staleFailure;
+    }
+  });
+
+  await suite.test("a 429 from a stale request always resets recovery and starts a new cooldown epoch", async () => {
+    const time = clock();
+    const gate = deferred();
+    const catalogService = service(async (input) => {
+      const term = new URL(input).searchParams.get("term");
+      if (term === "stale") return gate.promise;
+      return term === "limited" ? response([], 429, { "Retry-After": "1" }) : response();
+    }, time);
+    const staleFailure = assert.rejects(catalogService.request(search("stale")),
+      appleError(429, "apple_rate_limited", { retryAfterMs: 2000 }));
+    try {
+      await flush();
+      const limited = assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+      await time.advance(250);
+      await limited;
+      for (let index = 0; index < 3; index += 1) {
+        const healthy = catalogService.request(search(`healthy ${index}`));
+        await time.advance(index === 0 ? 1000 : 500);
+        await healthy;
+      }
+      gate.resolve(response([], 429, { "Retry-After": "2" }));
+      await staleFailure;
+      assert.equal(catalogService.interval, 1000);
+      for (let index = 0; index < 4; index += 1) {
+        const healthy = catalogService.request(search(`latest epoch ${index}`), { diagnostics: true });
+        await time.advance(index === 0 ? 2000 : 1000);
+        const result = await healthy;
+        assert.equal(result.diagnostics.intervalMs, index < 3 ? 1000 : 800);
+        assert.equal(result.diagnostics.rateLimitEvents, 2);
+        assert.equal(catalogService.cooldownUntil, 4250);
+      }
+    } finally {
+      gate.resolve(response([], 429, { "Retry-After": "2" }));
+      await staleFailure;
+    }
+  });
+
+  await suite.test("upstream errors reset the consecutive recovery streak", async () => {
+    for (const broken of [
+      () => new Response(null, { status: 503 }),
+      () => new Response(null, { status: 401 }),
+      () => new Response("malformed"),
+      () => { throw new Error("network"); },
+      () => response([], 429, { "Retry-After": "0" })
+    ]) {
+      let calls = 0;
+      const catalogService = service(async () => {
+        calls += 1;
+        if (calls === 1) return response([], 429, { "Retry-After": "0" });
+        if (calls === 5) return broken();
+        return response();
+      });
+      await assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+      for (let index = 0; index < 3; index += 1) await catalogService.request(search(`before-error ${index}`));
+      await assert.rejects(catalogService.request(search("broken")), (error) => error instanceof AppleError);
+      const interval = catalogService.interval;
+      for (let index = 0; index < 3; index += 1) {
+        await catalogService.request(search(`after-error ${index}`));
+        assert.equal(catalogService.interval, interval);
+      }
+      await catalogService.request(search("fourth after-error"));
+      assert.equal(catalogService.interval, interval === 1000 ? 800 : 400);
+    }
+  });
+
+  await suite.test("cache hits, deduped callers and batched ISRC siblings do not inflate the recovery streak", async () => {
+    let calls = 0;
+    const catalogService = service(async (input) => {
+      calls += 1;
+      if (calls === 1) return response([], 429, { "Retry-After": "0" });
+      const codes = new URL(input).searchParams.get("filter[isrc]");
+      return codes ? response(codes.split(",").map((code) => isrcSong(code)), 200, {}, "isrc") : response();
+    });
+    await assert.rejects(catalogService.request(search("limited")), appleError(429, "apple_rate_limited"));
+    const payloads = Array.from({ length: 4 }, (_, index) => ({ action: "isrc", isrcs: isrcs(index + 1) }));
+    await Promise.all([...payloads, payloads[0]].map((payload) => catalogService.request(payload)));
+    assert.equal(calls, 2);
+    assert.equal(catalogService.interval, 500);
+    for (const payload of payloads) assert.equal((await catalogService.request(payload)).cacheHit, true);
+    assert.equal(catalogService.interval, 500);
+    for (let index = 0; index < 2; index += 1) {
+      await catalogService.request(search(`success ${index}`));
+      assert.equal(catalogService.interval, 500);
+    }
+    await catalogService.request(search("fourth success"));
+    assert.equal(catalogService.interval, 400);
+  });
+
+  await suite.test("benchmarks capped 3000ms recovery against the previous 25ms-per-success policy", async (context) => {
+    const time = clock(0, true);
+    let calls = 0;
+    const catalogService = service(async () => {
+      calls += 1;
+      return calls <= 4 ? response([], 429, { "Retry-After": "0" }) : response();
+    }, time);
+    for (let index = 0; index < 4; index += 1) {
+      await assert.rejects(catalogService.request(search(`limited ${index}`)), appleError(429, "apple_rate_limited"));
+    }
+    assert.equal(catalogService.interval, 3000);
+    const startedAt = time.now();
+    let successes = 0;
+    while (catalogService.interval > 250 && successes < 150) {
+      await catalogService.request(search(`recovery ${successes++}`));
+    }
+    assert.equal(successes, 48);
+    assert.equal(time.now() - startedAt, 55924);
+    assert.equal(catalogService.interval, 250);
+    context.diagnostic(`3000ms -> 250ms, zero additional Retry-After/latency: previous = 110 successes / 180125ms; current = ${successes} successes / ${time.now() - startedAt}ms`);
   });
 
   await suite.test("bounds unique pending requests at 40 but permits dedupe and cache hits", async () => {

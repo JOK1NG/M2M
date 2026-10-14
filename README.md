@@ -53,6 +53,8 @@ When a source only exposes partial tracks, the API response is marked with `limi
 - Coalesces queued ISRC lookups within the same region and skips soundtrack descriptions that are not song titles.
 - Imports matched tracks in batches.
 - Shows success count, failure count, total progress, and failed track details.
+- Recognizes individual singers in collaboration credits and reports title, artist, duration, and version mismatches separately.
+- Offers account-region alternatives for explicit confirmation before creating the playlist; DJ versions and large duration differences are not silently substituted.
 - Exports parsed playlist data as JSON.
 
 ### How It Works
@@ -307,6 +309,10 @@ The existing `M2M_QUEUE` Durable Object also coordinates catalog requests; no ad
 
 The browser matches up to eight tracks concurrently. Queued ISRC lookups can share one upstream request for up to 25 distinct recording codes in the same region; each caller only receives its requested recordings. If a high-confidence recording is identified but no matching ISRC is returned in the account region, bounded alias searches still check for other original releases. If those also fail, the UI reports that separately from an unconfirmed match. This is not proof of a licensing restriction.
 
+Matching progress shows recent 30-second and overall rates, excluding manual pauses. The recent log records browser catalog queries per completed track, server cache hits, the shared request interval, queue depth, and 429 responses. The catalog API also returns anonymous numeric `diagnostics`; these contain no user credentials or other users' search terms. Rate-limit recovery reduces the interval by 20% after four consecutive successful requests from the current recovery period, never below the configured base interval. Older in-flight responses cannot undo a newer cooldown. Cache and log sizes remain bounded; identical workload tests cover 1,000 cold queries, including the period after 400.
+
+When the correct title and singer are found but only a different version or substantially different duration is available, matching continues for the rest of the playlist. Before any playlist is created, the user can compare source and candidate metadata, confirm a candidate, skip a track, or skip all remaining alternatives. Candidates always come from the account region, and no automatic fallback imports a DJ version in place of an unmarked original.
+
 Raise these limits only after validating queue behavior, upstream rate limits, and Apple Music import retries.
 
 ### Limitations
@@ -382,6 +388,8 @@ M2M 是一个部署在 Cloudflare Workers 上的在线歌单迁移工具，用�
 - 合并同地区排队中的 ISRC 查询，过滤影视说明等并非歌名的别名。
 - 批量导入匹配成功的歌曲。
 - 实时展示成功数、失败数、总进度和失败详情。
+- 支持多人署名中的歌手识别，并区分歌名、歌手、时长及版本不一致。
+- 创建歌单前可人工确认账号地区的候选；DJ 版及明显时长差异不会被默认替代。
 - 支持导出解析后的 JSON 数据。
 
 ### 工作流程
@@ -635,6 +643,10 @@ curl https://m2m.xinyu017722.workers.dev/health
 曲库协调复用现有 `M2M_QUEUE` Durable Object，无需新增绑定或迁移。未配置此绑定时，本地开发只使用单个 Worker 实例内的协调器，不能作为生产环境的全站限流方案。
 
 浏览器最多同时匹配八首歌。同地区排队中的 ISRC 查询可合并为一次上游请求，最多包含 25 个不同录音编码，各调用方只接收自己请求的录音。高置信识别出录音、但在账号地区未查到相同 ISRC 时，仍会进行有限的别名搜索，检查其他原版发行；兜底也失败后才显示区别于普通匹配失败的原因，这不等同于已确认版权缺失。
+
+匹配进度同时显示近 30 秒速度和全程平均速度，扣除手动暂停时间。近期日志记录每首已处理歌曲的浏览器曲库查询次数、服务端缓存命中率、全站请求间隔、排队数量和 429 响应次数。曲库接口新增匿名数值 `diagnostics`，不含用户凭据或其他人的搜索词。限流后，当前恢复周期每连续成功四次，将间隔降低 20%，但不会低于配置的基础间隔；限流前发出的旧请求不能抵消新的冷却。缓存及日志数量保持有界，并用 1000 次等量冷查询验证了第 400 首之后的调度。
+
+找到同名同歌手、但版本或时长明显不同的候选时，系统继续匹配歌单剩余歌曲。创建 Apple 歌单之前，用户可对比源曲目与候选的元数据，确认选中版本、跳过这首或跳过剩余项。候选仅来自账号地区，未标明 DJ 的原版不会被自动替换成 DJ 版。
 
 只有在验证队列行为、上游限流和 Apple Music 导入重试后，才建议提高这些限制。
 

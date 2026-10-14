@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import worker from "../src/index.js";
+import { QueueCoordinator } from "../src/queue.js";
+
+const diagnosticFields = ["activeRequests", "cooldownMs", "elapsedMs", "intervalMs", "queueDepth", "rateLimitEvents"];
+
+function assertDiagnostics(result) {
+  assert.deepEqual(Object.keys(result).sort(), ["cacheHit", "data", "diagnostics"]);
+  assert.deepEqual(Object.keys(result.diagnostics).sort(), diagnosticFields);
+  assert.ok(Object.values(result.diagnostics).every((value) => Number.isFinite(value) && value >= 0));
+  assert.doesNotMatch(JSON.stringify(result.diagnostics), /secret|query|token|client/);
+}
 
 test("catalog requests use the one global Durable Object and strip unrelated credentials", async () => {
   const requests = [];
@@ -14,13 +24,67 @@ test("catalog requests use the one global Durable Object and strip unrelated cre
   } };
   const response = await worker.fetch(new Request("https://m2m.example/apple/catalog", {
     method: "POST", headers: { "Content-Type": "application/json", "Music-User-Token": "never-forward" },
-    body: JSON.stringify({ action: "search", storefront: "cn", term: "生きていたんだよな", limit: 25, musicUserToken: "never-forward" })
+    body: JSON.stringify({ action: "search", storefront: "cn", term: "生きていたんだよな", limit: 25, musicUserToken: "never-forward",
+      diagnostics: { token: "never-forward" }, clientId: "never-forward", intervalMs: 1 })
   }), env);
   assert.equal(response.status, 200);
   assert.equal(requests[0].path, "/apple/catalog");
   assert.deepEqual(requests[0].body, { action: "search", storefront: "cn", term: "生きていたんだよな", limit: 25 });
   assert.ok(!JSON.stringify(requests).includes("never-forward"));
   assert.equal(response.headers.get("Cache-Control"), "no-store");
+});
+
+test("the Durable Object catalog route returns anonymous diagnostics without accepting client diagnostic fields", async (context) => {
+  context.mock.method(globalThis, "fetch", async (input, options) => {
+    assert.equal(new URL(input).origin, "https://api.music.apple.com");
+    assert.equal(new URL(input).searchParams.has("diagnostics"), false);
+    assert.equal(options.redirect, "manual");
+    assert.equal(new Headers(options.headers).has("Music-User-Token"), false);
+    return Response.json({ results: { songs: { data: [] } } });
+  });
+  const coordinator = new QueueCoordinator({}, { APPLE_DEVELOPER_TOKEN: "test-secret" });
+  const response = await coordinator.fetch(new Request("https://m2m-queue.local/apple/catalog", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "search", term: "private-query", diagnostics: false, clientId: "private-client", token: "test-secret" })
+  }));
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.deepEqual(result.data, []);
+  assertDiagnostics(result);
+  assert.equal(result.diagnostics.intervalMs, 250);
+  assert.equal(result.diagnostics.rateLimitEvents, 0);
+});
+
+test("the Worker fallback catalog route opts into diagnostics even when the client opts out", async (context) => {
+  context.mock.method(globalThis, "fetch", async (_input, options) => {
+    assert.equal(options.redirect, "manual");
+    assert.equal(new Headers(options.headers).has("Music-User-Token"), false);
+    return Response.json({ results: { songs: { data: [] } } });
+  });
+  const response = await worker.fetch(new Request("https://m2m.example/apple/catalog", {
+    method: "POST", headers: { "Content-Type": "application/json", "Music-User-Token": "test-secret" },
+    body: JSON.stringify({ action: "search", term: "private-query", diagnostics: false, clientId: "private-client", token: "test-secret" })
+  }), { APPLE_DEVELOPER_TOKEN: "test-secret" });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  const result = await response.json();
+  assert.deepEqual(result.data, []);
+  assertDiagnostics(result);
+  assert.equal(result.diagnostics.intervalMs, 250);
+});
+
+test("anonymous catalog diagnostics survive the global coordinator proxy unchanged", async () => {
+  const diagnostics = { elapsedMs: 1000, intervalMs: 500, queueDepth: 5, activeRequests: 4, cooldownMs: 30000, rateLimitEvents: 2 };
+  const env = { M2M_QUEUE: {
+    idFromName: () => "global", get: () => ({ fetch: async () => Response.json({ data: [], cacheHit: false, diagnostics }) })
+  } };
+  const response = await worker.fetch(new Request("https://m2m.example/apple/catalog", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "search", term: "Song" })
+  }), env);
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assertDiagnostics(result);
+  assert.deepEqual(result.diagnostics, diagnostics);
 });
 
 test("rejects invalid catalog payloads before contacting the coordinator", async () => {

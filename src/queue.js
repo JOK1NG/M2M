@@ -18,7 +18,7 @@ export class QueueCoordinator {
     const requestUrl = new URL(request.url);
     if (requestUrl.pathname === "/apple/catalog" && request.method === "POST") {
       try {
-        return jsonResponse(await this.appleCatalog.request(await request.json()));
+        return jsonResponse(await this.appleCatalog.request(await request.json(), { diagnostics: true }));
       } catch (error) {
         if (!(error instanceof AppleError)) throw error;
         const response = jsonResponse({ error: { code: error.code, message: error.message, details: error.details } }, error.status);
