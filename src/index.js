@@ -385,7 +385,8 @@ function errorResponse(error, request = null, env = null) {
           code: error.code,
           message: error.message,
           details: error.details || undefined
-        }
+        },
+        ...(error instanceof AppleError && error.diagnostics ? { diagnostics: error.diagnostics } : {})
       },
       error.status,
       request,

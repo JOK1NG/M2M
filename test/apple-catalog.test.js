@@ -114,6 +114,11 @@ function appleError(status, code, details) {
   };
 }
 
+function legacyDiagnostics(diagnostics) {
+  return Object.fromEntries(["elapsedMs", "intervalMs", "queueDepth", "activeRequests", "cooldownMs", "rateLimitEvents"]
+    .map(field => [field, diagnostics[field]]));
+}
+
 test("Apple catalog coordination", async (suite) => {
   let catalog;
   try {
@@ -397,15 +402,18 @@ test("Apple catalog coordination", async (suite) => {
       clientId: "private-client", diagnostics: { token: "personal-secret" }
     });
     const result = await catalogService.request(payload, { diagnostics: true, token: "personal-secret" });
-    assert.deepEqual(result, {
-      data: [song], cacheHit: false,
-      diagnostics: { elapsedMs: 125, intervalMs: 250, queueDepth: 0, activeRequests: 0, cooldownMs: 0, rateLimitEvents: 0 }
+    assert.deepEqual(result.data, [song]);
+    assert.equal(result.cacheHit, false);
+    assert.equal(result.cacheSource, "upstream");
+    assert.deepEqual(legacyDiagnostics(result.diagnostics), {
+      elapsedMs: 125, intervalMs: 250, queueDepth: 0, activeRequests: 0, cooldownMs: 0, rateLimitEvents: 0
     });
+    assert.ok(Object.values(result.diagnostics).every(value => Number.isFinite(value) && value >= 0));
     assert.doesNotMatch(JSON.stringify(result.diagnostics), /private|secret|query|token|client/);
     assert.deepEqual(await catalogService.request(payload), { data: [song], cacheHit: true });
     assert.deepEqual(await catalogService.request(payload, { diagnostics: false }), { data: [song], cacheHit: true });
     assert.deepEqual(await catalogService.request(payload, { diagnostics: "true" }), { data: [song], cacheHit: true });
-    assert.deepEqual((await catalogService.request(payload, { diagnostics: true })).diagnostics, {
+    assert.deepEqual(legacyDiagnostics((await catalogService.request(payload, { diagnostics: true })).diagnostics), {
       elapsedMs: 0, intervalMs: 250, queueDepth: 0, activeRequests: 0, cooldownMs: 0, rateLimitEvents: 0
     });
   });
@@ -449,7 +457,7 @@ test("Apple catalog coordination", async (suite) => {
     try {
       await flush();
       const result = await catalogService.request(search("cached"), { diagnostics: true });
-      assert.deepEqual(result.diagnostics, {
+      assert.deepEqual(legacyDiagnostics(result.diagnostics), {
         elapsedMs: 0, intervalMs: 500, queueDepth: 1, activeRequests: 1, cooldownMs: 60000, rateLimitEvents: 1
       });
       await time.advance(1000);

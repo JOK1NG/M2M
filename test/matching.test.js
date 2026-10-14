@@ -214,7 +214,7 @@ test("reuses target search candidates once a native catalog verifies their recor
     resolveIsrc: async () => assert.fail("The CN result already proves regional availability")
   });
   assert.equal(result.id, "cn");
-  assert.deepEqual(searches, ["cn", "jp"]);
+  assert.deepEqual(searches, ["cn", "cn", "jp"]);
 });
 
 test("equivalent generic version labels do not prevent a metadata match", () => {
@@ -270,7 +270,7 @@ test("ambiguous Han-only titles try mainland China and Japan without assuming a 
   assert.deepEqual(matcher.nativeStorefronts(track("晴天", ["周杰伦"])), ["cn", "jp"]);
 });
 
-test("verifies a Han-only title renamed in the US with just two searches", async () => {
+test("checks the original title-only before native verification of a Han-only title renamed in the US", async () => {
   const source = track("決意", ["V.W.P"]);
   const isrc = "JPY392402582";
   const calls = [];
@@ -285,7 +285,11 @@ test("verifies a Han-only title renamed in the US with just two searches", async
   });
   assert.equal(result.id, "us");
   assert.equal(result.matchMethod, "isrc");
-  assert.deepEqual(calls.map(call => call.region), ["us", "cn"]);
+  assert.deepEqual(calls, [
+    { region: "us", query: "決意 V.W.P" },
+    { region: "us", query: "決意" },
+    { region: "cn", query: "決意 V.W.P" }
+  ]);
 });
 
 test("falls back to Japan for an ambiguous title not identifiable in mainland China", async () => {
@@ -895,6 +899,142 @@ test("queries a translated title alias before native lookup without expanding ev
   assert.ok(calls.length <= 3);
 });
 
+for (const example of [
+  {
+    label: "multi-credit metadata", source: track("原語の曲", ["Publishing Credit", "Credited Singer"]),
+    artist: "Credited Singer", queries: ["原語の曲 Publishing Credit", "原語の曲"]
+  },
+  {
+    label: "authoritative singer aliases", source: track("原語の曲", ["歌手あ"], { artistAliases: ["Known Singer"] }),
+    artist: "Known Singer", queries: ["原語の曲 歌手あ", "原語の曲 Known Singer", "原語の曲"]
+  }
+]) {
+  test("original title-only discovery avoids native calls for " + example.label, async () => {
+    const calls = [];
+    const isrc = "JPAAA1200001";
+    const result = await matcher.match(example.source, {
+      storefront: "us", search: async (region, query) => {
+        calls.push({ region, query });
+        if (region === "jp") return [song("native-only", example.source.name, example.artist, { isrc })];
+        return query === example.source.name ? [song("account-original", example.source.name, example.artist, { isrc })] : [];
+      }, resolveIsrc: async (region, codes) => {
+        calls.push({ region, isrcs: codes });
+        return [];
+      }
+    });
+    assert.equal(result?.id, "account-original");
+    assert.equal(result.matchMethod, "metadata");
+    assert.deepEqual(calls, example.queries.map(query => ({ region: "us", query })));
+  });
+}
+
+test("original title-only localized artist evidence still needs native proof and reuses its exact ISRC", async () => {
+  const source = track("原語の曲", ["歌手あ"]);
+  const isrc = "JPAAA1200001";
+  const account = song("account-localized", source.name, "Localized Singer", { isrc });
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      calls.push({ region, query });
+      if (region === "jp") return [song("native-only", source.name, "歌手あ", { isrc })];
+      return query === source.name ? [account] : [];
+    }, resolveIsrc: async () => assert.fail("The account title-only result already contains the verified ISRC")
+  });
+  assert.equal(matcher.scoreCandidate(source, account), 0);
+  assert.equal(result?.id, "account-localized");
+  assert.equal(result.matchMethod, "isrc");
+  assert.deepEqual(calls, [
+    { region: "us", query: "原語の曲 歌手あ" },
+    { region: "us", query: "原語の曲" },
+    { region: "jp", query: "原語の曲 歌手あ" }
+  ]);
+});
+
+for (const candidate of [
+  song("uncertain", "Original Recording", "Localized Singer"),
+  song("dj", "Original Recording (DJ版)", "歌手あ"),
+  song("alias-dj", "Localized Title (DJ版)", "歌手あ"),
+  song("weak", "Original Recording", "歌手あ", { albumName: "Other album", durationInMillis: 204120 })
+]) {
+  test("original title-only " + candidate.id + " evidence cannot suppress native proof", async () => {
+    const source = track("Original Recording", ["歌手あ"], { aliases: ["Localized Title"] });
+    const isrc = "JPAAA1200001";
+    const calls = [];
+    const result = await matcher.match(source, {
+      storefront: "us", search: async (region, query) => {
+        calls.push({ region, query });
+        if (region === "jp") return [song("native-only", source.name, "歌手あ", { isrc })];
+        return query === source.name ? [candidate] : [];
+      }, resolveIsrc: async (region, codes) => {
+        calls.push({ region, isrcs: codes });
+        return [song("account-original", source.name, "歌手あ", { isrc })];
+      }
+    });
+    assert.equal(result?.id, "account-original");
+    assert.equal(result.matchMethod, "isrc");
+    assert.deepEqual(calls, [
+      { region: "us", query: "Original Recording 歌手あ" },
+      { region: "us", query: "Localized Title 歌手あ" },
+      { region: "us", query: "Original Recording" },
+      { region: "jp", query: "Original Recording 歌手あ" },
+      { region: "us", isrcs: [isrc] }
+    ]);
+  });
+}
+
+test("initial same-title version alternatives do not add a title-only query before a useful singer alias", async () => {
+  const source = track("Original Recording", ["歌手あ"], { artistAliases: ["Known Singer"] });
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      calls.push({ region, query });
+      return query === "Original Recording Known Singer" ? [song("account-original", source.name, "Known Singer")]
+        : [song("dj", "Original Recording (DJ版)", "歌手あ")];
+    }, resolveIsrc: async () => assert.fail("The useful authoritative singer alias found the original")
+  });
+  assert.equal(result?.id, "account-original");
+  assert.deepEqual(calls, [
+    { region: "us", query: "Original Recording 歌手あ" },
+    { region: "us", query: "Original Recording Known Singer" }
+  ]);
+});
+
+test("early original title-only discovery shares the six-query budget with all account fallbacks", async () => {
+  const source = track("原語の曲", ["歌手あ"], {
+    aliases: ["First Alias", "Second Alias", "Ignored Alias"], artistAliases: ["Known Singer"]
+  });
+  const calls = [];
+  assert.equal(await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      assert.ok(query.normalize("NFKC").length <= 256);
+      calls.push({ region, query });
+      return [];
+    }, resolveIsrc: async () => assert.fail("Empty catalogs cannot identify any ISRC")
+  }), null);
+  assert.deepEqual(calls, [
+    { region: "us", query: "原語の曲 歌手あ" },
+    { region: "us", query: "原語の曲 Known Singer" },
+    { region: "us", query: "First Alias 歌手あ" },
+    { region: "us", query: "原語の曲" },
+    { region: "jp", query: "原語の曲 歌手あ" },
+    { region: "jp", query: "原語の曲" },
+    { region: "us", query: "Second Alias 歌手あ" },
+    { region: "us", query: "First Alias" }
+  ]);
+  const accountQueries = calls.filter(call => call.region === "us").map(call => call.query);
+  assert.equal(accountQueries.length, 6);
+  assert.equal(new Set(accountQueries).size, 6);
+});
+
+test("original title-only discovery does not repeat an initial query without an artist credit", async () => {
+  const calls = [];
+  assert.equal(await matcher.match(track("原語の曲", []), {
+    storefront: "us", search: async (region, query) => { calls.push({ region, query }); return []; },
+    resolveIsrc: async () => assert.fail("Empty catalogs cannot identify any ISRC")
+  }), null);
+  assert.deepEqual(calls, [{ region: "us", query: "原語の曲" }, { region: "jp", query: "原語の曲" }]);
+});
+
 test("offers a distinctive same-title cross-script artist candidate only for explicit confirmation", async () => {
   const source = track("Kamura's Song of Purification", ["加藤いづみ"], {
     album: "Source soundtrack", durationMs: 194120
@@ -942,18 +1082,42 @@ test("native identification retains the original title-only query despite target
   assert.deepEqual(calls.filter(call => call.region === "jp").map(call => call.query), [source.name + " 歌手あ", source.name]);
 });
 
-test("an exact target title with unconfirmed artist goes directly to native ISRC proof rather than redundant translated aliases", async () => {
+test("an exact target title with unconfirmed artist needs only the initial account search and native ISRC proof", async () => {
   const source = track("Distinctive Recording", ["歌手あ"], { aliases: ["译名一", "译名二"] });
   const isrc = "JPAAA1200001";
   const calls = [];
   const result = await matcher.match(source, {
-    storefront: "us", search: async region => {
-      calls.push(region);
+    storefront: "us", search: async (region, query) => {
+      calls.push({ region, query });
       return [song(region, source.name, region === "us" ? "Localized Singer" : "歌手あ", { isrc })];
     }, resolveIsrc: async () => assert.fail("Verified recording is already in target candidates")
   });
   assert.equal(result?.id, "us");
-  assert.deepEqual(calls, ["us", "jp"]);
+  assert.equal(result.matchMethod, "isrc");
+  assert.deepEqual(calls, [
+    { region: "us", query: "Distinctive Recording 歌手あ" },
+    { region: "jp", query: "Distinctive Recording 歌手あ" }
+  ]);
+});
+
+test("an already identified account title still permits two independent original queries for native proof", async () => {
+  const source = track("原語の曲", ["歌手あ"], { aliases: ["Translated Title"] });
+  const isrc = "JPAAA1200001";
+  const calls = [];
+  const result = await matcher.match(source, {
+    storefront: "us", search: async (region, query) => {
+      calls.push({ region, query });
+      if (region === "us") return [song("account-localized", source.name, "Localized Singer", { isrc })];
+      return query === source.name ? [song("native-only", source.name, "歌手あ", { isrc })] : [];
+    }, resolveIsrc: async () => assert.fail("Native proof reuses the already collected account ISRC")
+  });
+  assert.equal(result?.id, "account-localized");
+  assert.equal(result.matchMethod, "isrc");
+  assert.deepEqual(calls, [
+    { region: "us", query: "原語の曲 歌手あ" },
+    { region: "jp", query: "原語の曲 歌手あ" },
+    { region: "jp", query: "原語の曲" }
+  ]);
 });
 
 test("independent album and exact duration can offer an unverified band versus vocalist credit but never auto-match it", async () => {
@@ -1028,7 +1192,7 @@ test("ambiguous native credits can map a recording into the account region for r
   assert.equal(result, null);
   assert.equal(notices[0].reason, "artist_mismatch");
   assert.deepEqual(notices[0].candidates.map(item => item.id), ["account-review"]);
-  assert.deepEqual(calls, ["cn", "jp", "cn"]);
+  assert.deepEqual(calls, ["cn", "cn", "jp"]);
 });
 
 test("review mapping rejects unrelated ISRCs, missing durations and recordings with conflicting versions", async () => {

@@ -1,5 +1,6 @@
 import { AppleError } from "./apple.js";
 import { AppleCatalogService } from "./apple-catalog.js";
+import { SqliteCatalogCache } from "./catalog-cache.js";
 
 const QUEUE_STORAGE_KEY = "m2m-queue-state-v1";
 const DEFAULT_MAX_ACTIVE = 2;
@@ -11,7 +12,9 @@ export class QueueCoordinator {
   constructor(state, env) {
     this.state = state;
     this.env = env || {};
-    this.appleCatalog = new AppleCatalogService(this.env);
+    this.appleCatalog = new AppleCatalogService(this.env, {
+      persistentCache: state.storage?.sql ? new SqliteCatalogCache(state.storage.sql) : undefined
+    });
   }
 
   async fetch(request) {
@@ -21,7 +24,7 @@ export class QueueCoordinator {
         return jsonResponse(await this.appleCatalog.request(await request.json(), { diagnostics: true }));
       } catch (error) {
         if (!(error instanceof AppleError)) throw error;
-        const response = jsonResponse({ error: { code: error.code, message: error.message, details: error.details } }, error.status);
+        const response = jsonResponse({ error: { code: error.code, message: error.message, details: error.details }, diagnostics: error.diagnostics }, error.status);
         if (error.details?.retryAfterMs) response.headers.set("Retry-After", String(Math.ceil(error.details.retryAfterMs / 1000)));
         return response;
       }

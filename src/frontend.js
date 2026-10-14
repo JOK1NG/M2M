@@ -365,6 +365,23 @@ export function renderAppHtml() {
       gap: 10px;
     }
 
+    .diagnostic-download {
+      width: 42px;
+      height: 42px;
+      padding: 0;
+      font-size: 20px;
+    }
+
+    .diagnostic-details {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+
+    .diagnostic-details summary { cursor: pointer; }
+    .diagnostic-details p { white-space: pre-line; }
+
     .playlist-name-panel {
       display: grid;
       gap: 8px;
@@ -441,6 +458,8 @@ export function renderAppHtml() {
 
     .log {
       display: grid;
+      grid-auto-rows: max-content;
+      align-content: start;
       gap: 8px;
       max-height: 178px;
       overflow: auto;
@@ -452,9 +471,11 @@ export function renderAppHtml() {
 
     .log-row {
       display: flex;
+      align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
       min-height: 18px;
+      line-height: 1.6;
     }
 
     .failed-panel {
@@ -493,6 +514,7 @@ export function renderAppHtml() {
     .version-candidate-title { font-size: 14px; font-weight: 760; }
     .version-candidate a { color: var(--accent-strong); font-size: 13px; width: fit-content; }
     .log-row span:first-child { min-width: 0; overflow-wrap: anywhere; }
+    .log-row span:last-child { flex: none; white-space: nowrap; }
 
     .badge {
       display: inline-flex;
@@ -917,7 +939,47 @@ export function renderAppHtml() {
               <button class="button secondary" id="pauseImport" type="button" disabled>暂停</button>
               <button class="button secondary" id="cancelImport" type="button" disabled>停止</button>
               <button class="button secondary" id="returnToParsed" type="button">返回歌单</button>
+              <button class="button secondary diagnostic-download" id="downloadDiagnostics" title="下载诊断 JSON" aria-label="下载诊断 JSON" type="button">
+                <svg class="lucide lucide-download" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <desc>Lucide download icon. ISC License.
+Copyright (c) 2026 Lucide Icons and Contributors
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+Derived from Feather. The MIT License (MIT).
+Copyright (c) 2013-present Cole Bemis
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.</desc>
+                  <path d="M12 15V3" />
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <path d="m7 10 5 5 5-5" />
+                </svg>
+              </button>
             </div>
+            <details class="diagnostic-details">
+              <summary>匹配诊断</summary>
+              <p id="catalogDiagnosticReadout">-</p>
+            </details>
           </section>
         </div>
       </section>
@@ -1045,6 +1107,8 @@ export function renderAppHtml() {
       importSucceeded: document.getElementById("importSucceeded"),
       importFailed: document.getElementById("importFailed"),
       importLog: document.getElementById("importLog"),
+      catalogDiagnosticReadout: document.getElementById("catalogDiagnosticReadout"),
+      downloadDiagnostics: document.getElementById("downloadDiagnostics"),
       failedPanel: document.getElementById("failedPanel"),
       failedListCount: document.getElementById("failedListCount"),
       failedTrackTable: document.getElementById("failedTrackTable"),
@@ -1080,6 +1144,7 @@ export function renderAppHtml() {
     elements.connectApple.addEventListener("click", () => connectAppleMusic());
     elements.applePlaylistName.addEventListener("input", () => validatePlaylistNameInput(false));
     elements.downloadJson.addEventListener("click", () => downloadParsedJson());
+    elements.downloadDiagnostics.addEventListener("click", () => downloadCatalogDiagnostics());
     elements.backToInput.addEventListener("click", () => resetToInput());
     elements.cancelQueue.addEventListener("click", () => cancelQueue());
     elements.pauseImport.addEventListener("click", () => toggleImportPause());
@@ -1703,6 +1768,20 @@ export function renderAppHtml() {
       };
     }
 
+    function recordCatalogProgress(completed) {
+      const metrics = state.catalogMetrics;
+      if (!metrics) return;
+      const time = Date.now();
+      const count = Number.isFinite(completed) && completed >= 0 ? completed : 0;
+      const requests = Number.isFinite(metrics.requests) && metrics.requests >= 0 ? metrics.requests : 0;
+      if (!metrics.progressSamples) metrics.progressSamples = [{ time: Number.isFinite(metrics.startedAt) ? metrics.startedAt : time, completed: 0, requests: 0 }];
+      const previous = metrics.progressSamples[metrics.progressSamples.length - 1];
+      if (previous.completed !== count || previous.requests !== requests) metrics.progressSamples.push({ time, completed: count, requests });
+      while (metrics.progressSamples.length > 2 && metrics.progressSamples[1].time <= time - 30000) metrics.progressSamples.shift();
+      while (metrics.progressSamples.length > 512) metrics.progressSamples.shift();
+      metrics.completed = count;
+    }
+
     async function importToAppleMusic(music, parsed, playlistName) {
       const tracks = parsed.tracks.filter((track) => !track.missing);
       const storefront = music.storefrontId || "cn";
@@ -1712,9 +1791,12 @@ export function renderAppHtml() {
       setImportProgress(8, "稳态匹配歌曲 0/" + tracks.length);
 
       state.matchMeter = createMatchMeter();
-      state.catalogMetrics = { requests: 0, cacheHits: 0, localCacheHits: 0, totalRoundTripMs: 0, rateLimited: 0 };
+      state.catalogMetrics = { requests: 0, cacheHits: 0, localCacheHits: 0, totalRoundTripMs: 0, rateLimited: 0,
+        startedAt: Date.now(), targetStorefront: storefront };
+      addLog(elements.importLog, "Workers 不提供宿主 CPU / 内存指标；缓存字节仅指序列化缓存大小，不是进程内存。");
       if (state.importControl && state.importControl.paused) state.matchMeter.pause();
       const matchResult = await matchAppleSongs(music, storefront, tracks, (progress) => {
+        recordCatalogProgress(progress.completed);
         const speed = state.matchMeter.sample(progress.completed);
         const percent = 8 + Math.round((progress.completed / Math.max(tracks.length, 1)) * 62);
         setImportProgress(
@@ -2032,7 +2114,7 @@ export function renderAppHtml() {
         const existing = searchCache.get(cacheKey);
         searchCache.delete(cacheKey);
         searchCache.set(cacheKey, existing);
-        if (state.catalogMetrics) state.catalogMetrics.localCacheHits += 1;
+        if (state.catalogMetrics) state.catalogMetrics.localCacheHits = catalogMetricNumber(state.catalogMetrics.localCacheHits) + 1;
       }
 
       return searchCache.get(cacheKey);
@@ -2041,7 +2123,17 @@ export function renderAppHtml() {
     async function requestAppleCatalog(payload, searchLimiter) {
       return runAppleSearchWithRetry("Apple catalog search", searchLimiter, async () => {
         const startedAt = Date.now();
-        if (state.catalogMetrics) state.catalogMetrics.requests += 1;
+        if (state.catalogMetrics) {
+          const metrics = state.catalogMetrics;
+          metrics.requests = catalogMetricNumber(metrics.requests) + 1;
+          const region = catalogStorefront(payload.storefront);
+          if (!metrics.queriesByStorefront) metrics.queriesByStorefront = {};
+          metrics.queriesByStorefront[region] = catalogMetricNumber(metrics.queriesByStorefront[region]) + 1;
+          const role = typeof metrics.targetStorefront === "string" && payload.storefront === metrics.targetStorefront ? "targetQueries" : "sourceQueries";
+          metrics[role] = catalogMetricNumber(metrics[role]) + 1;
+          if (payload.action === "search") metrics.searchQueries = catalogMetricNumber(metrics.searchQueries) + 1;
+          if (payload.action === "isrc") metrics.isrcQueries = catalogMetricNumber(metrics.isrcQueries) + 1;
+        }
         let response;
         let result;
         try {
@@ -2060,43 +2152,165 @@ export function renderAppHtml() {
         }
         recordCatalogDiagnostics(result, startedAt);
         if (!response.ok) {
-          if (state.catalogMetrics && response.status === 429) state.catalogMetrics.rateLimited += 1;
+          if (state.catalogMetrics && response.status === 429) state.catalogMetrics.rateLimited = catalogMetricNumber(state.catalogMetrics.rateLimited) + 1;
+          if (state.catalogMetrics && response.status >= 500 && response.status <= 599) state.catalogMetrics.serverErrors = catalogMetricNumber(state.catalogMetrics.serverErrors) + 1;
           const error = createAppleHttpError("Apple catalog search failed", response);
-          error.code = result.error && result.error.code;
-          if (result.error && result.error.details && Number.isFinite(result.error.details.retryAfterMs)) {
+          error.diagnostics = sanitizeCatalogDiagnostics(result && result.diagnostics, result && result.cacheSource);
+          error.code = result && result.error && result.error.code;
+          if (result && result.error && result.error.details && Number.isFinite(result.error.details.retryAfterMs)) {
             error.retryAfterMs = result.error.details.retryAfterMs;
           }
           throw error;
         }
-        return Array.isArray(result.data) ? result.data : [];
+        return result && Array.isArray(result.data) ? result.data : [];
       });
     }
 
     function recordCatalogDiagnostics(result, startedAt) {
       const metrics = state.catalogMetrics;
       if (!metrics) return;
-      metrics.totalRoundTripMs += Math.max(0, Date.now() - startedAt);
-      if (result && result.cacheHit === true) metrics.cacheHits += 1;
-      if (result && result.diagnostics) {
-        metrics.latest = {};
-        for (const field of ["elapsedMs", "intervalMs", "queueDepth", "activeRequests", "cooldownMs", "rateLimitEvents"]) {
-          const value = result.diagnostics[field];
-          if (Number.isFinite(value) && value >= 0) metrics.latest[field] = value;
+      const time = Date.now();
+      const roundTripMs = Math.max(0, time - startedAt);
+      metrics.totalRoundTripMs = catalogMetricNumber(metrics.totalRoundTripMs) + roundTripMs;
+      const latest = sanitizeCatalogDiagnostics(result && result.diagnostics, result && result.cacheSource);
+      metrics.latest = latest;
+      if (result && result.cacheHit === true) metrics.cacheHits = catalogMetricNumber(metrics.cacheHits) + 1;
+      if (latest.cacheSource === "memory") metrics.memoryCacheHits = catalogMetricNumber(metrics.memoryCacheHits) + 1;
+      if (latest.cacheSource === "persistent") metrics.persistentCacheHits = catalogMetricNumber(metrics.persistentCacheHits) + 1;
+      if (latest.coalesced > 0 || latest.cacheSource === "coalesced") metrics.coalescedResponses = catalogMetricNumber(metrics.coalescedResponses) + 1;
+      if (!metrics.requestSamples) metrics.requestSamples = [];
+      const cacheTiming = latest.cacheSource === "memory" || latest.cacheSource === "persistent" || (!latest.cacheSource && result && result.cacheHit === true);
+      metrics.requestSamples.push({ time, roundTripMs, queueWaitMs: cacheTiming ? undefined : latest.queueWaitMs,
+        upstreamMs: cacheTiming ? undefined : latest.upstreamMs, cacheReadMs: latest.cacheReadMs, cacheWriteMs: latest.cacheWriteMs });
+      while (metrics.requestSamples.length && metrics.requestSamples[0].time < time - 30000) metrics.requestSamples.shift();
+      while (metrics.requestSamples.length > 512) metrics.requestSamples.shift();
+    }
+
+    function catalogMetricNumber(value) {
+      return Number.isFinite(value) && value >= 0 ? value : 0;
+    }
+
+    function catalogStorefront(value) {
+      return ["cn", "jp", "kr", "us", "hk", "tw", "gb", "au", "ca", "de", "fr", "sg", "in", "br", "mx"]
+        .includes(value) ? value : "other";
+    }
+
+    function sanitizeCatalogDiagnostics(diagnostics, cacheSource) {
+      const safe = {};
+      if (diagnostics && typeof diagnostics === "object") {
+        for (const field of ["elapsedMs", "queueWaitMs", "upstreamMs", "cacheReadMs", "cacheWriteMs", "intervalMs", "queueDepth",
+          "activeRequests", "cooldownMs", "rateLimitEvents", "concurrencyLimit", "pendingRequests", "pendingLimit",
+          "memoryCacheEntries", "memoryCacheBytes", "persistentCacheEntries", "persistentCacheBytes", "upstreamRequests",
+          "upstreamFailures", "timeoutEvents", "serverUptimeMs", "persistentCacheErrors", "coalesced"]) {
+          const value = diagnostics[field];
+          if (Number.isFinite(value) && value >= 0) safe[field] = value;
         }
       }
+      const source = cacheSource || (diagnostics && diagnostics.cacheSource);
+      if (["memory", "persistent", "upstream", "coalesced"].includes(source)) safe.cacheSource = source;
+      return safe;
+    }
+
+    function catalogMetricsSnapshot(completed) {
+      const metrics = state.catalogMetrics || {};
+      const time = Date.now();
+      const progress = metrics.progressSamples || [];
+      let anchorIndex = 0;
+      while (anchorIndex < progress.length - 1 && progress[anchorIndex + 1].time <= time - 30000) anchorIndex += 1;
+      const anchor = progress[anchorIndex] || { completed: 0, requests: 0 };
+      const snapshot = { completed: catalogMetricNumber(completed), requests: catalogMetricNumber(metrics.requests) };
+      snapshot.recentRequests = Math.max(0, snapshot.requests - anchor.requests);
+      snapshot.recentSongs = Math.max(0, snapshot.completed - anchor.completed);
+      snapshot.recentRequestsPerSong = snapshot.recentSongs ? snapshot.recentRequests / snapshot.recentSongs : 0;
+      snapshot.lifetimeRequestsPerSong = snapshot.requests / Math.max(snapshot.completed, 1);
+      const samples = (metrics.requestSamples || []).filter(sample => sample.time >= time - 30000).slice(-512);
+      for (const [field, prefix] of [["roundTripMs", "roundTrip"], ["queueWaitMs", "queueWait"], ["upstreamMs", "upstream"],
+        ["cacheReadMs", "cacheRead"], ["cacheWriteMs", "cacheWrite"]]) {
+        const values = samples.map(sample => sample[field]).filter(value => Number.isFinite(value) && value >= 0);
+        snapshot[prefix + "Samples"] = values.length;
+        snapshot[prefix + "AverageMs"] = values.length ? values.reduce((total, value) => total + value, 0) / values.length : 0;
+        if (prefix === "roundTrip") {
+          values.sort((left, right) => left - right);
+          snapshot.roundTripP95Ms = values.length ? values[Math.ceil(values.length * 0.95) - 1] : 0;
+        }
+      }
+      for (const field of ["localCacheHits", "memoryCacheHits", "persistentCacheHits", "coalescedResponses", "rateLimited", "serverErrors",
+        "retries", "activeRetries", "lastRetryStatus", "lastRetryDelayMs", "sourceQueries", "targetQueries", "searchQueries", "isrcQueries"]) {
+        snapshot[field] = catalogMetricNumber(metrics[field]);
+      }
+      snapshot.sharedCacheHits = catalogMetricNumber(metrics.cacheHits);
+      snapshot.queriesByStorefront = {};
+      for (const [region, count] of Object.entries(metrics.queriesByStorefront || {})) {
+        if (catalogStorefront(region) === region || region === "other") snapshot.queriesByStorefront[region] = catalogMetricNumber(count);
+      }
+      snapshot.backend = sanitizeCatalogDiagnostics(metrics.latest);
+      delete snapshot.backend.cacheSource;
+      return snapshot;
     }
 
     function catalogMetricsText(completed) {
       const metrics = state.catalogMetrics;
-      const average = metrics.requests / Math.max(completed, 1);
-      const cachePercent = metrics.requests ? Math.round(metrics.cacheHits / metrics.requests * 100) : 0;
-      let text = "查询 " + average.toFixed(1) + " 次/首，服务端缓存 " + cachePercent + "%";
-      if (metrics.latest) {
-        text += "，上游间隔 " + (metrics.latest.intervalMs || 0) + "ms，排队 " + (metrics.latest.queueDepth || 0);
-        if (metrics.latest.rateLimitEvents) text += "，共享限流 " + metrics.latest.rateLimitEvents + " 次";
+      if (!metrics) return "诊断尚未开始";
+      recordCatalogProgress(completed);
+      const snapshot = catalogMetricsSnapshot(completed);
+      if (!metrics.snapshots) metrics.snapshots = [];
+      metrics.snapshots.push(snapshot);
+      while (metrics.snapshots.length > 512) metrics.snapshots.shift();
+      const backend = snapshot.backend;
+      const serverValue = field => Number.isFinite(backend[field]) ? String(backend[field]) : "-";
+      const latency = prefix => snapshot[prefix + "Samples"] ? snapshot[prefix + "AverageMs"].toFixed(0) + "ms" : "-";
+      const p95 = snapshot.roundTripSamples ? snapshot.roundTripP95Ms.toFixed(0) + "ms" : "-";
+      const cachePercent = hits => snapshot.requests ? Math.round(hits / snapshot.requests * 100) : 0;
+      let text = "近30秒查询 " + snapshot.recentRequestsPerSong.toFixed(1) + " 次/首 · RTT " + latency("roundTrip") + " / p95 " + p95;
+      text += " · 队列 " + latency("queueWait") + " / 上游 " + latency("upstream");
+      text += " · 缓存 " + cachePercent(snapshot.sharedCacheHits) + "%（持久 " + cachePercent(snapshot.persistentCacheHits) + "%，本地 " + snapshot.localCacheHits + "）";
+      text += " · 活跃 " + serverValue("activeRequests") + "/" + serverValue("concurrencyLimit") + " / 排队 " + serverValue("queueDepth");
+      text += " · 间隔 " + (Number.isFinite(backend.intervalMs) ? serverValue("intervalMs") + "ms" : "-");
+      text += " · 429 " + snapshot.rateLimited + " / 5xx " + snapshot.serverErrors + " / 超时 " + serverValue("timeoutEvents");
+      if (typeof elements !== "undefined" && elements.catalogDiagnosticReadout) {
+        const details = [
+          "近30秒查询 " + snapshot.recentRequestsPerSong.toFixed(1) + " 次/首（" + snapshot.recentRequests + " 次 / " + snapshot.recentSongs + " 首），最多 512 个样本",
+          "往返均值 " + latency("roundTrip") + " / p95 " + p95 + "（" + snapshot.roundTripSamples + " 个响应）",
+          "非缓存请求排队均值 " + latency("queueWait") + "，上游均值 " + latency("upstream") + "（排队 " + snapshot.queueWaitSamples + " / 上游 " + snapshot.upstreamSamples + " 个样本）",
+          "缓存 本地 " + snapshot.localCacheHits + " / 共享 " + snapshot.sharedCacheHits + "（内存 " + snapshot.memoryCacheHits + " / 持久 " + snapshot.persistentCacheHits + " / 合并 " + snapshot.coalescedResponses + "）",
+          "缓存读取均值 " + latency("cacheRead") + " / 写入均值 " + latency("cacheWrite") + "（读取 " + snapshot.cacheReadSamples + " / 写入 " + snapshot.cacheWriteSamples + " 个样本）",
+          "重试 " + snapshot.retries + " 次 / 等待 " + snapshot.activeRetries + (snapshot.lastRetryStatus ? "，最近 HTTP " + snapshot.lastRetryStatus + " / " + snapshot.lastRetryDelayMs + "ms" : ""),
+          "服务端活跃 " + serverValue("activeRequests") + "/" + serverValue("concurrencyLimit") + "，队列 " + serverValue("queueDepth") + "，待处理 " + serverValue("pendingRequests") + "/" + serverValue("pendingLimit"),
+          "上游间隔 " + serverValue("intervalMs") + "ms，冷却 " + serverValue("cooldownMs") + "ms，共享限流 " + serverValue("rateLimitEvents") + " / 本次 429 " + snapshot.rateLimited + " / 5xx " + snapshot.serverErrors,
+          "上游失败 " + serverValue("upstreamFailures") + " / 超时 " + serverValue("timeoutEvents") + " / 持久缓存错误 " + serverValue("persistentCacheErrors"),
+          "序列化缓存 内存 " + serverValue("memoryCacheBytes") + "B / " + serverValue("memoryCacheEntries") + " 条，持久 " + serverValue("persistentCacheBytes") + "B / " + serverValue("persistentCacheEntries") + " 条",
+          "服务运行 " + (Number.isFinite(backend.serverUptimeMs) ? (backend.serverUptimeMs / 1000).toFixed(0) + "s" : "-"),
+          "来源地区请求 " + snapshot.sourceQueries + " / 目标地区请求 " + snapshot.targetQueries + "，搜索 " + snapshot.searchQueries + " / ISRC " + snapshot.isrcQueries,
+          "地区 " + Object.entries(snapshot.queriesByStorefront).map(([region, count]) => region + " " + count).join(" / ")
+        ];
+        elements.catalogDiagnosticReadout.textContent = details.join("\\n");
       }
-      if (metrics.rateLimited) text += "，本次限流响应 " + metrics.rateLimited + " 次";
       return text;
+    }
+
+    function downloadCatalogDiagnostics() {
+      const metrics = state.catalogMetrics || {};
+      const aggregates = catalogMetricsSnapshot(metrics.completed);
+      const fields = Object.keys(aggregates).filter(field => typeof aggregates[field] === "number");
+      const logs = (metrics.snapshots || []).slice(-512).map(snapshot => {
+        const safe = {};
+        for (const field of fields) {
+          const value = snapshot[field];
+          if (Number.isFinite(value) && value >= 0) safe[field] = value;
+        }
+        safe.backend = sanitizeCatalogDiagnostics(snapshot.backend);
+        delete safe.backend.cacheSource;
+        safe.queriesByStorefront = {};
+        for (const [region, count] of Object.entries(snapshot.queriesByStorefront || {})) {
+          if ((catalogStorefront(region) === region || region === "other") && Number.isFinite(count) && count >= 0) safe.queriesByStorefront[region] = count;
+        }
+        return safe;
+      });
+      const blob = new Blob([JSON.stringify({ version: 1, aggregates, logs }, null, 2)], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "m2m-diagnostics.json";
+      try { link.click(); } finally { URL.revokeObjectURL(link.href); }
     }
 
     function pauseForAppleSearch() {
@@ -2137,22 +2351,39 @@ export function renderAppHtml() {
 
     async function runAppleSearchWithRetry(label, searchLimiter, operation) {
       let lastError = null;
+      const metrics = state.catalogMetrics;
+      let waitingForRetry = false;
 
-      for (let attempt = 0; attempt <= SEARCH_MAX_RETRIES; attempt += 1) {
-        await searchLimiter.waitTurn();
+      try {
+        for (let attempt = 0; attempt <= SEARCH_MAX_RETRIES; attempt += 1) {
+          await searchLimiter.waitTurn();
+          if (waitingForRetry && metrics) metrics.activeRetries = Math.max(0, catalogMetricNumber(metrics.activeRetries) - 1);
+          waitingForRetry = false;
 
-        try {
-          return await operation();
-        } catch (error) {
-          lastError = error;
-          if (!shouldRetryAppleSearch(error) || error.code === "apple_credentials_missing" || attempt >= SEARCH_MAX_RETRIES) {
-            throw error;
+          try {
+            return await operation();
+          } catch (error) {
+            lastError = error;
+            if (!shouldRetryAppleSearch(error) || error.code === "apple_credentials_missing" || attempt >= SEARCH_MAX_RETRIES) {
+              throw error;
+            }
+
+            const delayMs = appleSearchRetryDelay(error, attempt);
+            const status = getErrorStatus(error);
+            if (metrics) {
+              metrics.retries = catalogMetricNumber(metrics.retries) + 1;
+              metrics.activeRetries = catalogMetricNumber(metrics.activeRetries) + 1;
+              metrics.lastRetryStatus = status;
+              metrics.lastRetryDelayMs = delayMs;
+            }
+            waitingForRetry = true;
+            noteAppleRateLimit(label, delayMs, status);
+            if (status === 429) searchLimiter.penalize(delayMs);
+            else await waitWithImportControl(delayMs);
           }
-
-          const delayMs = appleSearchRetryDelay(error, attempt);
-          searchLimiter.penalize(delayMs);
-          noteAppleRateLimit(label, delayMs, getErrorStatus(error));
         }
+      } finally {
+        if (waitingForRetry && metrics) metrics.activeRetries = Math.max(0, catalogMetricNumber(metrics.activeRetries) - 1);
       }
 
       throw lastError || new Error("Apple search failed.");
@@ -2304,6 +2535,8 @@ export function renderAppHtml() {
 
     function resetImportMetrics() {
       elements.importLog.innerHTML = "";
+      state.catalogMetrics = null;
+      if (elements.catalogDiagnosticReadout) elements.catalogDiagnosticReadout.textContent = "-";
       state.failedTracks = new Map();
       state.failedTrackRows = new Map();
       elements.failedTrackTable.innerHTML = "";

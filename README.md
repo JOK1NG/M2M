@@ -79,6 +79,7 @@ When a source only exposes partial tracks, the API response is marked with `limi
 - `src/apple.js`: Apple Music Developer Token generation.
 - `src/matching.js`: Shared multilingual matching and recording/version checks.
 - `src/apple-catalog.js`: Public catalog cache, global request scheduling, and Apple rate-limit handling.
+- `src/catalog-cache.js`: Bounded SQLite persistence for public catalog results in the existing Durable Object.
 - `src/queue.js`: Durable Object queue coordinator.
 - `test/*.test.js`: Node.js test suites.
 
@@ -91,11 +92,13 @@ The backend only handles:
 - Public playlist parsing.
 - Temporary queue state.
 - Site-level Apple Music Developer Token generation.
-- Public Apple Music catalog searches and temporary in-memory caching of catalog results.
+- Public Apple Music catalog searches and bounded, expiring memory/SQLite caches of catalog results.
 
 Apple Music user authorization is handled by MusicKit JS in the browser. Requests that modify the user's Apple Music library use the browser-side Music User Token.
 
-Catalog requests contain a region and public track metadata, never a Music User Token. The shared cache holds up to 500 queries, with a six-hour TTL for results and five minutes for empty results. It is not persisted to Durable Object storage and can be cleared when the instance restarts. Playlist creation and library writes remain browser-to-Apple requests.
+Catalog requests contain a region and public track metadata, never a Music User Token. The shared memory cache holds up to 500 queries and 4 MiB of serialized result payloads. The existing SQLite-backed Durable Object also persists up to 10,000 results and 32 MiB of serialized payloads across instance restarts and deployments. Both layers preserve a six-hour TTL for results and five minutes for empty results; errors are never cached. Persistent keys are hashes of region-specific normalized requests, and values contain only public catalog fields, not account identifiers, playlist ownership, or subscriber credentials. Storage errors fall back to memory and upstream lookup. Playlist creation and library writes remain browser-to-Apple requests.
+
+Persistent cache operations have a one-second asynchronous wait deadline; cancelled and older writes cannot overwrite newer results. A failed SQLite store retries initialization after a one-minute cooldown. Cache reads and upstream work share the same 40-operation pending bound, including identical-request deduplication.
 
 ### Apple Music Authentication
 
@@ -198,11 +201,13 @@ Returns an Apple Music Developer Token for MusicKit JS.
 
 #### `POST /apple/catalog`
 
-Searches public catalog songs or resolves recordings by ISRC through the shared coordinator. Requests accept either `{ "action": "search", "storefront": "cn", "term": "song artist", "limit": 25 }` or `{ "action": "isrc", "storefront": "cn", "isrcs": ["JPWP01671360"] }`. The response contains `data` and `cacheHit`. No subscriber credentials are required or forwarded.
+Searches public catalog songs or resolves recordings by ISRC through the shared coordinator. Requests accept either `{ "action": "search", "storefront": "cn", "term": "song artist", "limit": 25 }` or `{ "action": "isrc", "storefront": "cn", "isrcs": ["JPWP01671360"] }`. The response contains `data`, `cacheHit`, `cacheSource`, and anonymous numeric `diagnostics`. No subscriber credentials are required or forwarded.
 
 Invalid requests are rejected. Temporary errors include `error.details.retryAfterMs`, and the frontend respects the full delay. After repeated temporary failures, the import pauses without counting the current track as missing.
 
 ### Local Development
+
+CI and local verification use Node.js 22; SQLite regression tests use its built-in `node:sqlite` module.
 
 ```sh
 npm install
@@ -302,14 +307,18 @@ Current `wrangler.toml` defaults:
 - `NETEASE_MAX_TRACKS=2000`
 - `NETEASE_BATCH_SIZE=200`
 - `QUEUE_MAX_ACTIVE=2`
-- `APPLE_SEARCH_INTERVAL_MS=250`: minimum time between uncached Apple catalog request starts, shared across users. A 429 response increases this interval and pauses new starts for the full `Retry-After` period.
+- `APPLE_SEARCH_INTERVAL_MS=200`: minimum time between uncached Apple catalog request starts, shared across users. This is M2M's configured protection, not Apple's published quota. A 429 response increases this interval and pauses new starts for the full `Retry-After` period.
 - `APPLE_SEARCH_CONCURRENCY=4`: maximum upstream requests in flight, bounded to 1–6. Concurrency hides network latency without increasing the configured start rate.
 
 The existing `M2M_QUEUE` Durable Object also coordinates catalog requests; no additional binding or migration is required. Without that binding, local development uses a per-Worker-instance coordinator, which is not a global production rate limit.
 
 The browser matches up to eight tracks concurrently. Queued ISRC lookups can share one upstream request for up to 25 distinct recording codes in the same region; each caller only receives its requested recordings. If a high-confidence recording is identified but no matching ISRC is returned in the account region, bounded alias searches still check for other original releases. If those also fail, the UI reports that separately from an unconfirmed match. This is not proof of a licensing restriction.
 
-Matching progress shows recent 30-second and overall rates, excluding manual pauses. The recent log records browser catalog queries per completed track, server cache hits, the shared request interval, queue depth, and 429 responses. The catalog API also returns anonymous numeric `diagnostics`; these contain no user credentials or other users' search terms. Rate-limit recovery reduces the interval by 20% after four consecutive successful requests from the current recovery period, never below the configured base interval. Older in-flight responses cannot undo a newer cooldown. Cache and log sizes remain bounded; identical workload tests cover 1,000 cold queries, including the period after 400.
+Matching progress shows recent 30-second and overall rates, excluding manual pauses. Logs distinguish recent and cumulative query counts, round-trip average and P95, queue wait, upstream response time, cache source, concurrency, pending work, retries, and search/ISRC region counts. Numeric diagnostics include the Durable Object runtime age, upstream failures/timeouts, and serialized cache entries and bytes; none contain subscriber credentials or other users' search terms. Cache byte counts are not process heap usage or allocated SQLite disk size. Host CPU utilization, CPU core counts, and free system memory are unavailable to the public Worker; actual invocation CPU and isolate memory metrics belong in the administrator's [Cloudflare Metrics and Analytics dashboard](https://developers.cloudflare.com/workers/observability/metrics-and-analytics/), not a public endpoint requiring Cloudflare account credentials.
+
+A temporary 5xx/network failure retries only the affected request rather than stalling every matching worker. Three consecutive upstream failures trigger a two-second shared cooldown and a slower start interval. Rate-limit recovery reduces the interval by 20% after four consecutive successful requests from the current recovery period, never below the configured base interval; older in-flight responses cannot undo a newer cooldown. Cache, timing samples, and logs remain bounded. Tests cover 1,000 cold queries including the period after 400, and a 1,000-query replay after service recreation with no additional upstream calls. These are deterministic simulations, not a guarantee of production throughput.
+
+The import toolbar can download a diagnostic JSON containing only numeric aggregate snapshots, not raw logs, playlist/song names, URLs, or tokens. The download icon is from [Lucide](https://github.com/lucide-icons/lucide); its ISC and inherited Feather MIT notices are retained in the embedded SVG metadata. Server timing fields are approximate wall-clock observations, not CPU measurements; Workers clocks advance on I/O, so synchronous cache work can report zero milliseconds. Cached responses are excluded from upstream/queue averages. If the initial account search has no exact title, one original title-only account query runs before native-region probes; this can avoid unnecessary cross-region requests without weakening artist/version checks, but not every track needs fewer queries.
 
 Chinese-context titles, singer credits, and albums are compared using OpenCC Traditional-to-Simplified conversion without changing the original metadata. Kana, Hangul, and Cyrillic contexts are not treated as Chinese. Authoritative source artist aliases and translated titles are searched in the account region before native-region fallbacks, with at most six distinct target queries and no exhaustive alias combinations. Conversion is local to the browser and its cache is bounded to 1,000 entries; no AI service or additional user data store is involved.
 
@@ -420,6 +429,7 @@ M2M 是一个部署在 Cloudflare Workers 上的在线歌单迁移工具，用�
 - `src/apple.js`：Apple Music Developer Token 生成。
 - `src/matching.js`：多语言匹配、录音识别与版本检查。
 - `src/apple-catalog.js`：公开曲库缓存、共享请求调度与 Apple 限流处理。
+- `src/catalog-cache.js`：在现有 Durable Object 中持久化公开曲库结果，并限制容量。
 - `src/queue.js`：Durable Object 队列协调器。
 - `test/*.test.js`：Node.js 测试。
 
@@ -432,11 +442,13 @@ M2M 不会在服务端保存用户账号、Apple ID、Apple Music User Token 或
 - 解析公开歌单链接。
 - 维护临时排队状态。
 - 生成站点级 Apple Music Developer Token。
-- 搜索 Apple Music 公开曲库，临时缓存曲库搜索结果。
+- 搜索 Apple Music 公开曲库，用有容量限制和有效期的内存/SQLite 缓存复用结果。
 
 用户级 Apple Music 授权由 MusicKit JS 在浏览器内完成。修改用户 Apple Music 资料库的请求使用浏览器中的 Music User Token。
 
-曲库请求仅携带地区和公开歌曲信息，不携带 Music User Token。共享内存缓存最多保留 500 个查询，有结果缓存 6 小时，空结果缓存 5 分钟；不会写入 Durable Object 持久存储，实例重启后可能清空。创建歌单和写入资料库仍由浏览器直接请求 Apple。
+曲库请求仅携带地区和公开歌曲信息，不携带 Music User Token。共享内存缓存最多保留 500 个查询、4 MiB 序列化结果；现有 SQLite Durable Object 额外持久化最多 10000 个查询、32 MiB 序列化结果，实例重启和代码部署后仍可复用。两层缓存均保留结果 6 小时、空结果 5 分钟，不缓存错误；从持久缓存载入时不会延长原来的有效期。持久缓存键为分地区规范化请求的哈希，内容只有公开曲库字段，不保存账号标识、歌单归属或用户授权凭据。存储异常时退回内存缓存及上游查询。创建歌单和写入资料库仍由浏览器直接请求 Apple。
+
+持久缓存操作的异步等待上限为一秒；已取消或较旧的写入不能覆盖较新的结果。SQLite 存储出错后冷却一分钟再尝试初始化。缓存读取与上游任务共同受 40 个待处理操作的上限约束，并合并相同请求。
 
 ### Apple Music 授权
 
@@ -539,11 +551,13 @@ curl "https://m2m.xinyu017722.workers.dev/playlist?url=https%3A%2F%2F163cn.tv%2F
 
 #### `POST /apple/catalog`
 
-通过共享协调器搜索公开歌曲，或按 ISRC 查找对应录音。请求体为 `{ "action": "search", "storefront": "cn", "term": "歌名 歌手", "limit": 25 }` 或 `{ "action": "isrc", "storefront": "cn", "isrcs": ["JPWP01671360"] }`，返回 `data` 与 `cacheHit`。无需提供用户授权凭据，也不会向 Apple 转发用户 token。
+通过共享协调器搜索公开歌曲，或按 ISRC 查找对应录音。请求体为 `{ "action": "search", "storefront": "cn", "term": "歌名 歌手", "limit": 25 }` 或 `{ "action": "isrc", "storefront": "cn", "isrcs": ["JPWP01671360"] }`，返回 `data`、`cacheHit`、`cacheSource` 及匿名数值 `diagnostics`。无需提供用户授权凭据，也不会向 Apple 转发用户 token。
 
 临时错误会包含 `error.details.retryAfterMs`，前端按完整等待时间重试。多次临时失败后暂停导入，当前曲目不会被计为未找到。
 
 ### 本地开发
+
+CI 和本地验证使用 Node.js 22；SQLite 回归测试依赖内置的 `node:sqlite` 模块。
 
 ```sh
 npm install
@@ -643,14 +657,18 @@ curl https://m2m.xinyu017722.workers.dev/health
 - `NETEASE_MAX_TRACKS=2000`
 - `NETEASE_BATCH_SIZE=200`
 - `QUEUE_MAX_ACTIVE=2`
-- `APPLE_SEARCH_INTERVAL_MS=250`：全站未命中缓存的 Apple 曲库请求最小启动间隔。收到 429 后增大间隔，并等待完整的 `Retry-After` 时间。
+- `APPLE_SEARCH_INTERVAL_MS=200`：全站未命中缓存的 Apple 曲库请求最小启动间隔。这是 M2M 的保护配置，不是 Apple 公布的固定配额。收到 429 后增大间隔，并等待完整的 `Retry-After` 时间。
 - `APPLE_SEARCH_CONCURRENCY=4`：最多同时进行四个上游请求，可配置范围为 1–6。并发用于覆盖网络等待时间，不会提高配置的请求启动频率。
 
 曲库协调复用现有 `M2M_QUEUE` Durable Object，无需新增绑定或迁移。未配置此绑定时，本地开发只使用单个 Worker 实例内的协调器，不能作为生产环境的全站限流方案。
 
 浏览器最多同时匹配八首歌。同地区排队中的 ISRC 查询可合并为一次上游请求，最多包含 25 个不同录音编码，各调用方只接收自己请求的录音。高置信识别出录音、但在账号地区未查到相同 ISRC 时，仍会进行有限的别名搜索，检查其他原版发行；兜底也失败后才显示区别于普通匹配失败的原因，这不等同于已确认版权缺失。
 
-匹配进度同时显示近 30 秒速度和全程平均速度，扣除手动暂停时间。近期日志记录每首已处理歌曲的浏览器曲库查询次数、服务端缓存命中率、全站请求间隔、排队数量和 429 响应次数。曲库接口新增匿名数值 `diagnostics`，不含用户凭据或其他人的搜索词。限流后，当前恢复周期每连续成功四次，将间隔降低 20%，但不会低于配置的基础间隔；限流前发出的旧请求不能抵消新的冷却。缓存及日志数量保持有界，并用 1000 次等量冷查询验证了第 400 首之后的调度。
+匹配进度同时显示近 30 秒速度和全程平均速度，扣除手动暂停时间。日志区分近期与累计查询次数、往返平均及 P95、排队等待、上游响应耗时、缓存来源、并发、待处理数量、重试，以及各地区搜索/ISRC 查询计数。匿名数值诊断还包含 Durable Object 运行时长、上游失败及超时次数、缓存条目和序列化字节数，不含用户授权或其他人的搜索词。缓存字节数不等于进程堆内存或 SQLite 实际磁盘占用。公开 Worker 无法读取宿主机 CPU 使用率、核数及系统剩余内存；真实请求 CPU 时间与 isolate 内存请在管理员的 [Cloudflare Metrics and Analytics](https://developers.cloudflare.com/workers/observability/metrics-and-analytics/) 中查看，不向网页暴露 Cloudflare 管理凭据。
+
+临时 5xx 或网络错误只让当前请求退避重试，不阻塞全部匹配线程；连续三个上游失败才触发两秒共享冷却并降低请求频率。恢复周期每连续成功四次，将间隔降低 20%，不会低于配置的基础间隔；旧的在途响应不能抵消新的冷却。缓存、耗时采样及日志数量保持有界。测试覆盖第 400 首之后的 1000 次等量冷查询，以及重建服务后重跑 1000 次查询且不新增上游请求；这些是确定性模拟，不保证线上固定吞吐。
+
+导入工具栏可下载诊断 JSON，仅包含数值统计快照，不包含原始日志、歌单名、歌名、URL 或令牌。下载图标来自 [Lucide](https://github.com/lucide-icons/lucide)，嵌入 SVG 元数据保留 ISC 和继承的 Feather MIT 声明。服务端耗时是近似墙钟观测，不是 CPU 时间；Workers 时钟在 I/O 时推进，同步缓存工作可能显示为零毫秒。缓存响应不参与上游及排队耗时均值。首次账号地区查询没有精确歌名时，优先补查一次原歌名，再进行原语言地区检索，有机会减少无效跨区请求；不降低歌手或版本检查，也不保证每首歌都减少查询。
 
 中文上下文的歌名、歌手署名和专辑使用 OpenCC 繁转简后比较，不改动原始元数据；包含日文假名、韩文或西里尔字母的上下文不会被当成中文处理。优先在账号地区搜索源平台提供的歌手别名及译名，再进行原语言地区兜底；目标地区最多六个不同查询，不穷举所有别名组合。转换在浏览器本地完成，缓存最多 1000 项，不使用 AI 服务或新增用户数据存储。
 

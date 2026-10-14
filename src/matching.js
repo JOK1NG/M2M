@@ -361,6 +361,9 @@ export function createSongMatcher() {
     const identifiedTitle = Array.from(targetEvidence.values()).some(evidence => evidence.inspection.titleSimilarity === 1);
     const earlyQueries = hasArtistAlias || !identifiedTitle
       ? queries.slice(1).filter(query => !sourceNames.includes(query)).slice(0, 2) : [];
+    if (!hasInitialAlternatives && !identifiedTitle && queries.includes(sourceNames[0]) && !searched.has(sourceNames[0])) {
+      earlyQueries.push(sourceNames[0]);
+    }
     for (const query of earlyQueries) {
       const candidates = await options.search(storefront, query);
       searched.add(query);

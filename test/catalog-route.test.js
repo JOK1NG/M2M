@@ -5,10 +5,16 @@ import worker from "../src/index.js";
 import { QueueCoordinator } from "../src/queue.js";
 
 const diagnosticFields = ["activeRequests", "cooldownMs", "elapsedMs", "intervalMs", "queueDepth", "rateLimitEvents"];
+const extendedDiagnosticFields = [...diagnosticFields, "queueWaitMs", "upstreamMs", "cacheReadMs", "cacheWriteMs",
+  "concurrencyLimit", "pendingRequests", "pendingLimit", "memoryCacheEntries", "memoryCacheBytes",
+  "persistentCacheEntries", "persistentCacheBytes", "persistentCacheErrors", "upstreamRequests",
+  "upstreamFailures", "timeoutEvents", "serverUptimeMs", "coalesced"].sort();
 
 function assertDiagnostics(result) {
-  assert.deepEqual(Object.keys(result).sort(), ["cacheHit", "data", "diagnostics"]);
-  assert.deepEqual(Object.keys(result.diagnostics).sort(), diagnosticFields);
+  const extended = result.cacheSource !== undefined;
+  assert.deepEqual(Object.keys(result).sort(), extended ? ["cacheHit", "cacheSource", "data", "diagnostics"] : ["cacheHit", "data", "diagnostics"]);
+  if (extended) assert.ok(["memory", "persistent", "upstream", "coalesced"].includes(result.cacheSource));
+  assert.deepEqual(Object.keys(result.diagnostics).sort(), extended ? extendedDiagnosticFields : diagnosticFields);
   assert.ok(Object.values(result.diagnostics).every((value) => Number.isFinite(value) && value >= 0));
   assert.doesNotMatch(JSON.stringify(result.diagnostics), /secret|query|token|client/);
 }

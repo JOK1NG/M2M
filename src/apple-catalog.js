@@ -5,6 +5,8 @@ const POSITIVE_TTL_MS = 6 * 60 * 60 * 1000;
 const EMPTY_TTL_MS = 5 * 60 * 1000;
 const PENDING_LIMIT = 40;
 const REQUEST_TIMEOUT_MS = 12000;
+const MEMORY_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const CACHE_OPERATION_TIMEOUT_MS = 1000;
 const STRING_ATTRIBUTES = ["name", "artistName", "albumName", "isrc", "contentRating", "url"];
 
 export function normalizeCatalogRequest(payload) {
@@ -63,11 +65,22 @@ export class AppleCatalogService {
     this.cooldownUntil = 0;
     this.rateLimitEvents = 0;
     this.recoveryStreak = 0;
+    this.recoveryEpoch = 0;
+    this.failureStreak = 0;
+    this.startedAt = this.now();
+    this.upstreamRequests = 0;
+    this.upstreamFailures = 0;
+    this.timeoutEvents = 0;
     this.active = 0;
     this.draining = false;
     this.queue = [];
     this.inFlight = new Map();
     this.cache = new Map();
+    this.memoryCacheBytes = 0;
+    this.memoryCacheMaxBytes = Number.isInteger(options.memoryCacheMaxBytes) && options.memoryCacheMaxBytes > 0
+      ? Math.min(options.memoryCacheMaxBytes, MEMORY_CACHE_MAX_BYTES) : MEMORY_CACHE_MAX_BYTES;
+    this.persistentCache = options.persistentCache;
+    this.persistentCacheErrors = 0;
     this.token = null;
     this.tokenPromise = null;
   }
@@ -79,51 +92,129 @@ export class AppleCatalogService {
     const key = JSON.stringify(normalized);
     const cached = this.cache.get(key);
     if (cached) {
-      this.cache.delete(key);
+      this.deleteMemoryCache(key);
       if (cached.expiresAt > this.now()) {
         this.cache.set(key, cached);
-        return this.requestResult(cached.data, true, startedAt, includeDiagnostics);
+        this.memoryCacheBytes += cached.bytes;
+        return this.requestResult(cached.data, true, startedAt, includeDiagnostics, {}, "memory");
       }
     }
-
-    let operation = this.inFlight.get(key);
-    if (!operation) {
-      if (this.inFlight.size >= PENDING_LIMIT) {
-        throw new AppleError(429, "apple_queue_full", "Apple Music catalog queue is full.", { retryAfterMs: 2000 });
+    let coalesced = false;
+    try {
+      let operation = this.inFlight.get(key);
+      coalesced = Boolean(operation);
+      if (!operation) {
+        if (this.inFlight.size >= PENDING_LIMIT) {
+          throw new AppleError(429, "apple_queue_full", "Apple Music catalog queue is full.", { retryAfterMs: 2000 });
+        }
+        operation = this.performRequest(normalized, key).finally(() => { this.inFlight.delete(key); });
+        this.inFlight.set(key, operation);
       }
-      let resolve;
-      let reject;
-      const pending = new Promise((accept, fail) => { resolve = accept; reject = fail; });
-      operation = pending.then((data) => {
-        this.cache.delete(key);
-        this.cache.set(key, {
-          data,
-          expiresAt: this.now() + (data.length ? POSITIVE_TTL_MS : EMPTY_TTL_MS)
-        });
-        if (this.cache.size > CACHE_LIMIT) this.cache.delete(this.cache.keys().next().value);
-        return data;
-      }).finally(() => {
-        this.inFlight.delete(key);
+      const record = await operation;
+      return this.requestResult(record.data, record.cacheHit, startedAt, includeDiagnostics,
+        { ...record, coalesced: coalesced || record.coalesced ? 1 : 0 },
+        !record.cacheHit && coalesced ? "coalesced" : record.cacheSource);
+    } catch (error) {
+      if (!includeDiagnostics) throw error;
+      const wrapped = error instanceof AppleError ? new AppleError(error.status, error.code, error.message, error.details) : unavailable();
+      wrapped.diagnostics = this.diagnostics(startedAt, {
+        ...error?.catalogTiming, coalesced: coalesced || error?.catalogTiming?.coalesced ? 1 : 0
       });
-      this.inFlight.set(key, operation);
-      this.queue.push({ normalized, resolve, reject });
-      this.drain();
+      throw wrapped;
     }
-    return this.requestResult(await operation, false, startedAt, includeDiagnostics);
   }
 
-  requestResult(data, cacheHit, startedAt, includeDiagnostics) {
+  async performRequest(normalized, key) {
+    const cacheReadStartedAt = this.now();
+    let cacheReadFinishedAt = cacheReadStartedAt;
+    try {
+      if (this.persistentCache) {
+        let stored;
+        try { stored = await this.cacheOperation(signal => this.persistentCache.get(key, cacheReadStartedAt, { signal })); }
+        catch { this.persistentCacheErrors += 1; }
+        cacheReadFinishedAt = this.now();
+        if (stored && Array.isArray(stored.data) && stored.expiresAt > this.now()) {
+          const data = publicSongs(stored.data);
+          const expiresAt = Math.min(stored.expiresAt, this.now() + (data.length ? POSITIVE_TTL_MS : EMPTY_TTL_MS));
+          this.setMemoryCache(key, data, expiresAt);
+          return { data, cacheHit: true, cacheSource: "persistent", cacheReadStartedAt, cacheReadFinishedAt };
+        }
+      }
+      const record = await new Promise((resolve, reject) => {
+        this.queue.push({ normalized, resolve, reject, queuedAt: this.now() });
+        this.drain();
+      });
+      const cacheWriteStartedAt = this.now();
+      const expiresAt = cacheWriteStartedAt + (record.data.length ? POSITIVE_TTL_MS : EMPTY_TTL_MS);
+      this.setMemoryCache(key, record.data, expiresAt);
+      if (this.persistentCache) {
+        try { await this.cacheOperation(signal => this.persistentCache.put(key, record.data, expiresAt, cacheWriteStartedAt, { signal })); }
+        catch { this.persistentCacheErrors += 1; }
+      }
+      return { ...record, cacheHit: false, cacheSource: "upstream", cacheReadStartedAt, cacheReadFinishedAt,
+        cacheWriteStartedAt, cacheWriteFinishedAt: this.now() };
+    } catch (error) {
+      error.catalogTiming = { ...error.catalogTiming, cacheReadStartedAt, cacheReadFinishedAt };
+      throw error;
+    }
+  }
+
+  async cacheOperation(operation) {
+    const controller = new AbortController();
+    let timer;
+    try {
+      return await Promise.race([Promise.resolve().then(() => operation(controller.signal)), new Promise((_resolve, reject) => {
+        timer = setTimeout(() => { controller.abort(); reject(unavailable()); }, CACHE_OPERATION_TIMEOUT_MS);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+
+  deleteMemoryCache(key) {
+    const previous = this.cache.get(key);
+    if (previous) this.memoryCacheBytes = Math.max(0, this.memoryCacheBytes - previous.bytes);
+    this.cache.delete(key);
+  }
+
+  setMemoryCache(key, data, expiresAt) {
+    this.deleteMemoryCache(key);
+    const bytes = new TextEncoder().encode(JSON.stringify(data)).byteLength;
+    if (bytes > this.memoryCacheMaxBytes) return;
+    this.cache.set(key, { data, expiresAt, bytes });
+    this.memoryCacheBytes += bytes;
+    while (this.cache.size > CACHE_LIMIT || this.memoryCacheBytes > this.memoryCacheMaxBytes) {
+      this.deleteMemoryCache(this.cache.keys().next().value);
+    }
+  }
+
+  diagnostics(startedAt, timing = {}) {
+    const now = this.now();
+    const elapsedMs = Math.max(0, now - startedAt);
+    const overlap = (start, end) => Number.isFinite(start) && Number.isFinite(end)
+      ? Math.max(0, Math.min(now, end) - Math.max(startedAt, start)) : 0;
+    const queueWaitMs = overlap(timing.queueEnteredAt, timing.upstreamStartedAt);
+    let persistent = {};
+    try { persistent = this.persistentCache?.stats() || {}; } catch { this.persistentCacheErrors += 1; }
+    return {
+      elapsedMs, queueWaitMs,
+      upstreamMs: overlap(timing.upstreamStartedAt, timing.upstreamFinishedAt),
+      cacheReadMs: overlap(timing.cacheReadStartedAt, timing.cacheReadFinishedAt),
+      cacheWriteMs: overlap(timing.cacheWriteStartedAt, timing.cacheWriteFinishedAt),
+      intervalMs: this.interval, queueDepth: this.queue.length, activeRequests: this.active,
+      cooldownMs: Math.max(0, this.cooldownUntil - now), rateLimitEvents: this.rateLimitEvents,
+      concurrencyLimit: this.concurrency, pendingRequests: this.inFlight.size, pendingLimit: PENDING_LIMIT,
+      memoryCacheEntries: this.cache.size, memoryCacheBytes: this.memoryCacheBytes,
+      persistentCacheEntries: persistent.entries || 0, persistentCacheBytes: persistent.bytes || 0,
+      persistentCacheErrors: this.persistentCacheErrors + (persistent.errors || 0),
+      upstreamRequests: this.upstreamRequests, upstreamFailures: this.upstreamFailures,
+      timeoutEvents: this.timeoutEvents, serverUptimeMs: Math.max(0, now - this.startedAt), coalesced: timing.coalesced || 0
+    };
+  }
+
+  requestResult(data, cacheHit, startedAt, includeDiagnostics, timing = {}, cacheSource = "upstream") {
     const result = { data: structuredClone(data), cacheHit };
     if (includeDiagnostics) {
-      const now = this.now();
-      result.diagnostics = {
-        elapsedMs: Math.max(0, now - startedAt),
-        intervalMs: this.interval,
-        queueDepth: this.queue.length,
-        activeRequests: this.active,
-        cooldownMs: Math.max(0, this.cooldownUntil - now),
-        rateLimitEvents: this.rateLimitEvents
-      };
+      result.cacheSource = cacheSource;
+      result.diagnostics = this.diagnostics(startedAt, timing);
     }
     return result;
   }
@@ -169,13 +260,20 @@ export class AppleCatalogService {
           normalized = { ...normalized, isrcs: [...isrcs].sort() };
         }
         this.active += 1;
-        this.send(normalized, developerToken).then((data) => {
+        const sentAt = this.now();
+        this.send(normalized, developerToken).then((record) => {
           for (const sibling of jobs) {
-            sibling.resolve(normalized.action === "isrc"
-              ? data.filter((item) => sibling.normalized.isrcs.includes(item.attributes.isrc)) : data);
+            sibling.resolve({ ...record, queueEnteredAt: sibling.queuedAt, upstreamStartedAt: sentAt, coalesced: jobs.length > 1 ? 1 : 0,
+              data: normalized.action === "isrc"
+                ? record.data.filter((item) => sibling.normalized.isrcs.includes(item.attributes.isrc)) : record.data });
           }
         }, (error) => {
-          for (const sibling of jobs) sibling.reject(error);
+          for (const sibling of jobs) {
+            const wrapped = error instanceof AppleError ? new AppleError(error.status, error.code, error.message, error.details) : unavailable();
+            wrapped.catalogTiming = { queueEnteredAt: sibling.queuedAt, upstreamStartedAt: sentAt,
+              upstreamFinishedAt: this.now(), coalesced: jobs.length > 1 ? 1 : 0 };
+            sibling.reject(wrapped);
+          }
         }).finally(() => {
           this.active -= 1;
           this.drain();
@@ -210,12 +308,14 @@ export class AppleCatalogService {
   }
 
   async send(normalized, developerToken) {
-    const epoch = this.rateLimitEvents;
+    const epoch = this.recoveryEpoch;
     const startedAt = this.now();
+    this.upstreamRequests += 1;
     const controller = new AbortController();
     let timer;
     const deadline = new Promise((_resolve, reject) => {
       timer = setTimeout(() => {
+        this.timeoutEvents += 1;
         controller.abort();
         reject(unavailable());
       }, REQUEST_TIMEOUT_MS);
@@ -224,16 +324,29 @@ export class AppleCatalogService {
       const data = await Promise.race([
         this.fetchSongs(normalized, developerToken, controller.signal), deadline
       ]);
-      if (epoch === this.rateLimitEvents && startedAt >= this.cooldownUntil && this.interval > this.baseInterval) {
-        this.recoveryStreak += 1;
-        if (this.recoveryStreak >= 4) {
-          this.interval = Math.max(this.baseInterval, Math.ceil(this.interval * 0.8));
-          this.recoveryStreak = 0;
+      if (epoch === this.recoveryEpoch && startedAt >= this.cooldownUntil) {
+        this.failureStreak = 0;
+        if (this.interval > this.baseInterval) {
+          this.recoveryStreak += 1;
+          if (this.recoveryStreak >= 4) {
+            this.interval = Math.max(this.baseInterval, Math.ceil(this.interval * 0.8));
+            this.recoveryStreak = 0;
+          }
         }
       }
-      return data;
+      return { data, upstreamStartedAt: startedAt, upstreamFinishedAt: this.now() };
     } catch (error) {
-      if (epoch === this.rateLimitEvents) this.recoveryStreak = 0;
+      this.upstreamFailures += 1;
+      if (epoch === this.recoveryEpoch) {
+        this.recoveryStreak = 0;
+        if (error.status < 500) this.failureStreak = 0;
+        if (error.status >= 500 && ++this.failureStreak >= 3) {
+          this.recoveryEpoch += 1;
+          this.failureStreak = 0;
+          this.cooldownUntil = Math.max(this.cooldownUntil, this.now() + 2000);
+          this.interval = Math.max(this.baseInterval, Math.min(3000, Math.ceil(this.interval * 1.5)));
+        }
+      }
       throw error;
     } finally {
       clearTimeout(timer);
@@ -264,7 +377,9 @@ export class AppleCatalogService {
       const now = this.now();
       const retryAfterMs = parseRetryAfter(response.headers?.get("Retry-After"), now);
       this.rateLimitEvents += 1;
+      this.recoveryEpoch += 1;
       this.recoveryStreak = 0;
+      this.failureStreak = 0;
       this.cooldownUntil = Math.max(this.cooldownUntil, now + retryAfterMs);
       this.interval = Math.max(this.baseInterval, Math.min(3000, this.interval * 2));
       throw new AppleError(429, "apple_rate_limited", "Apple Music catalog is temporarily rate limited.", {
